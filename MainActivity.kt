@@ -46,9 +46,16 @@ class MainActivity : Activity() {
             Store.settings(this).edit().putInt("sel_min", v).apply()
         }
 
+    private var tickCount = 0
+
     private val ticker = object : Runnable {
         override fun run() {
             try {
+                tickCount++
+                // the first ticks only: the self-close happens ~1-2 s after
+                // open, so ticks 1-5 show whether the activity was still
+                // alive and ticking when the process died
+                if (tickCount <= 5) Diag.crumb("ticker tick #$tickCount")
                 Store.finalizeIfExpired(this@MainActivity)
                 // a DND restore that failed earlier (permission revoked
                 // mid-lock) is retried while no lock runs
@@ -77,6 +84,8 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        Diag.init(this) // backstop: App.onCreate already installed the handler
+        Diag.crumb("MainActivity.onCreate start")
         L.load(this)
         C.load(this)
         tab = savedInstanceState?.getInt("tab") ?: 0
@@ -106,13 +115,22 @@ class MainActivity : Activity() {
         applyChrome()
         navHolder.addView(buildNav())
         Scheduler.onAlarm(this)
+        Diag.crumb("Scheduler.onAlarm done")
         Reminders.rescheduleAll(this) // morning alarms (idempotent)
+        Diag.crumb("Reminders.rescheduleAll done")
         TimeCapsules.checkDue(this) // a capsule may have opened while the app was closed
+        Diag.crumb("TimeCapsules.checkDue done")
         go(tab, false)
+        Diag.crumb("go(tab) done")
         Store.kickService(this) // restart the foreground service if it was swiped away
+        Diag.crumb("kickService called")
         Watchdog.enqueue(this) // safety net: restart the service every 15 min if it dies
+        Diag.crumb("Watchdog.enqueue done")
         PlaceWatcher.checkNow(this) // already at a saved place? lock right away
+        Diag.crumb("PlaceWatcher.checkNow called")
         PlaceWatcher.checkUnlockNow(this) // location-unlock session? check arrival right away
+        Diag.crumb("PlaceWatcher.checkUnlockNow called")
+        Diag.crumb("MainActivity.onCreate end")
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
@@ -123,6 +141,7 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         isForeground = true
+        Diag.crumb("onResume")
         handler.post(ticker)
         if (tab == 3) go(3, false) // refresh permission status after returning from system settings
         if (tab == 4) PowerBlockService.diagOpen = true // back on Protection: the Diagnostic card is visible
@@ -130,12 +149,14 @@ class MainActivity : Activity() {
 
     override fun onPause() {
         isForeground = false
+        Diag.crumb("onPause")
         handler.removeCallbacks(ticker)
         PowerBlockService.diagOpen = false // the app is in the background: no card is visible
         super.onPause()
     }
 
     override fun onDestroy() {
+        Diag.crumb("onDestroy")
         VoiceQuotes.shutdown()
         Store.flushRoutePoints(this) // persist any batched route points
         super.onDestroy()

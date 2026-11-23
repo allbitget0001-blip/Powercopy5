@@ -224,6 +224,8 @@ class PowerBlockService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         destroyed = false
+        Diag.init(this) // backstop: App.onCreate already installed the handler
+        Diag.crumb("PowerBlockService.onServiceConnected")
         try {
             L.load(this)
             readState()

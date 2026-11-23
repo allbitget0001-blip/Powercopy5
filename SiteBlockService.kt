@@ -136,6 +136,8 @@ class SiteBlockService : VpnService() {
     private var dnsPool: ExecutorService? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        Diag.init(this) // backstop: App.onCreate already installed the handler
+        Diag.crumb("SiteBlockService.onStartCommand action=${intent?.action}")
         when (intent?.action) {
             ACTION_STOP -> stopVpn()
             ACTION_START -> startVpn()

@@ -174,6 +174,8 @@ class KeepAliveService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        Diag.init(this) // backstop: App.onCreate already installed the handler
+        Diag.crumb("KeepAliveService.onStartCommand start")
         try {
             L.load(this)
             val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
@@ -195,18 +197,26 @@ class KeepAliveService : Service() {
             // kills the process ~10 s after a startForegroundService start
             startFg(minimalNotification())
             refresh()
+            Diag.crumb("refresh done")
             handler.removeCallbacks(heartbeatTask)
             handler.post(heartbeatTask) // fresh heartbeat every 60s so the accessibility service can tell we are alive
             FocusSound.sync(this) // resume the focus sound after a restart if a lock is running
+            Diag.crumb("FocusSound.sync done")
             SiteBlock.sync(this) // resume the site-block VPN after a restart if a lock is running
+            Diag.crumb("SiteBlock.sync done")
             // location lock no longer uses sessions: end any old location session, the flag takes over
             if (Store.isLocationSession(this)) Store.stopSession(this, force = true)
             PlaceWatcher.sync(this) // resume location watching after a restart/reboot
+            Diag.crumb("PlaceWatcher.sync done")
             PlaceWatcher.checkNow(this) // already at a saved place? lock right away
+            Diag.crumb("PlaceWatcher.checkNow called")
             PlaceWatcher.checkUnlockNow(this) // location-unlock session? check arrival right away
+            Diag.crumb("PlaceWatcher.checkUnlockNow called")
             Watchdog.enqueue(this) // safety net: restart the service every 15 min if it dies
+            Diag.crumb("onStartCommand end")
         } catch (e: Exception) {
             Log.e(TAG, "KeepAliveService start failed", e)
+            Diag.crumb("onStartCommand FAILED: ${e.javaClass.simpleName}: ${e.message}")
         }
         return START_STICKY
     }
@@ -239,12 +249,26 @@ class KeepAliveService : Service() {
             if (hasUsableLocation()) type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
             try {
                 startForeground(1, notification, type)
+                Diag.crumb("startFg ok type=$type")
             } catch (e: SecurityException) {
                 Log.w(TAG, "location-type foreground start refused, retrying specialUse", e)
-                startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+                Diag.crumb("startFg location refused, retrying specialUse")
+                // build 70: the fallback used to throw uncaught out of
+                // startFg, leaving the foreground promise unfulfilled with
+                // no record of why — now a failure is recorded in the trail
+                // before it propagates to onStartCommand's catch
+                try {
+                    startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+                    Diag.crumb("startFg fallback ok specialUse")
+                } catch (e2: Exception) {
+                    Log.e(TAG, "specialUse foreground start failed", e2)
+                    Diag.crumb("startFg fallback FAILED: ${e2.javaClass.simpleName}: ${e2.message}")
+                    throw e2
+                }
             }
         } else {
             startForeground(1, notification)
+            Diag.crumb("startFg ok (legacy)")
         }
     }
 
@@ -330,6 +354,7 @@ class KeepAliveService : Service() {
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
+        Diag.crumb("KeepAliveService.onTaskRemoved (swiped from Recents)")
         try {
             // swiped away from Recents: restart so the lock keeps working
             try {
@@ -408,6 +433,7 @@ class KeepAliveService : Service() {
     }
 
     override fun onDestroy() {
+        Diag.crumb("KeepAliveService.onDestroy")
         handler.removeCallbacks(finishTask)
         handler.removeCallbacks(heartbeatTask)
         try {

@@ -3372,6 +3372,9 @@ class SettingsScreen(private val a: MainActivity) {
         }
         col.addView(perm, lp(MATCH, WRAP, b = a.dp(12)))
 
+        // crash + startup diagnostics: the last crash and the startup trail
+        col.addView(a.crashDiagCard(), lp(MATCH, WRAP, b = a.dp(12)))
+
         // about
         val about = a.card()
         about.addView(a.section(L.t("About PowerLock 2", "PowerLock 2 সম্পর্কে")))

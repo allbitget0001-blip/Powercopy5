@@ -76,7 +76,7 @@ object Extra {
 
     /** Build number, bumped on every push — shown in Settings so the user can
      * confirm which build is installed. A String because L.num takes a String. */
-    const val BUILD_ID = "69"
+    const val BUILD_ID = "70"
 
     // ---------- presets ----------
 
@@ -949,6 +949,7 @@ object PlaceWatcher {
         if (!Store.settings(app).getBoolean("loc_on", false)) return
         if (!Perm.locationOn(app)) return
         Extra.currentLocation(app) { loc ->
+            Diag.crumb("checkNow callback loc=" + (loc != null))
             if (loc != null) handle(app, loc)
         }
     }
@@ -967,6 +968,7 @@ object PlaceWatcher {
         if (now - lastUnlockCheck < 30_000L) return
         lastUnlockCheck = now
         Extra.currentLocation(app) { loc ->
+            Diag.crumb("checkUnlockNow callback loc=" + (loc != null))
             if (loc == null) return@currentLocation
             if (loc.hasAccuracy() && loc.accuracy > 200f) return@currentLocation
             checkUnlockArrival(app, loc)
@@ -1941,6 +1943,57 @@ fun MainActivity.diagnosticCard(): View {
         PowerBlockService.debugLog.clear()
         PowerBlockService.debugSummary.clear()
         Toast.makeText(this, L.t("Log cleared", "লগ মুছে ফেলা হয়েছে"), Toast.LENGTH_SHORT).show()
+    }
+    row.addView(clearBtn, lp(0, WRAP, weight = 1f))
+    c.addView(row)
+    return c
+}
+
+/** Crash + startup diagnostics card (Settings): the last recorded crash and
+ * the startup breadcrumb trail, so an app that closes by itself can be
+ * traced instead of guessed. Everything is stored on the device only — the
+ * log leaves the phone only when the user copies it. */
+fun MainActivity.crashDiagCard(): View {
+    val c = card()
+    c.addView(section(L.t("Diagnostics", "ডায়াগনস্টিক")), lp(MATCH, WRAP, b = dp(6)))
+    c.addView(tv(L.t("If the app closes by itself, the reason is recorded here: the last crash and the steps the app took just before it died. Open the log, copy it and send it to find out why.", "অ্যাপ নিজে থেকে বন্ধ হয়ে গেলে তার কারণ এখানে রেকর্ড থাকে: শেষ ক্র্যাশ আর মারা যাওয়ার ঠিক আগে অ্যাপ কোন কোন ধাপ পার করেছিল। লগ দেখে কপি করে পাঠালে বোঝা যাবে কেন বন্ধ হয়েছিল।"), 13f, C.muted), lp(MATCH, WRAP, b = dp(10)))
+    val crash = Diag.lastCrash(this)
+    // crash line 3 is "ExceptionClass: message" (lines 1-2 are time and thread)
+    val crashLine = crash?.lines()?.getOrNull(2) ?: L.t("No crash recorded", "কোনো ক্র্যাশ রেকর্ড হয়নি")
+    val crumbs = Diag.crumbsText(this)
+    val crumbCount = if (crumbs.isEmpty()) 0 else crumbs.lines().size
+    c.addView(tv(L.t("Build ", "বিল্ড ") + L.num(Extra.BUILD_ID), 13f, C.text), lp(MATCH, WRAP, b = dp(4)))
+    c.addView(tv(L.t("Last crash: ", "শেষ ক্র্যাশ: ") + crashLine, 13f, if (crash == null) C.muted else C.text), lp(MATCH, WRAP, b = dp(4)))
+    c.addView(tv(L.t("Startup trail: ", "শুরুর ধাপ: ") + L.num(crumbCount.toString()) + " " + L.t("events", "টি ঘটনা"), 13f, C.muted), lp(MATCH, WRAP, b = dp(10)))
+    val row = LinearLayout(this)
+    row.orientation = LinearLayout.HORIZONTAL
+    val viewBtn = outlineBtn(L.t("View log", "লগ দেখুন"), C.primary)
+    viewBtn.setOnClickListener {
+        val report = Diag.fullReport(this)
+        val tvLog = tv(report, 11f, C.text)
+        val svLog = ScrollView(this)
+        svLog.addView(tvLog)
+        val body = LinearLayout(this)
+        body.orientation = LinearLayout.VERTICAL
+        body.setPadding(dp(20), dp(12), dp(20), dp(4))
+        body.addView(svLog, lp(MATCH, dp(400)))
+        dlg()
+            .setTitle(L.t("Diagnostic log", "ডায়াগনস্টিক লগ"))
+            .setView(body)
+            .setPositiveButton(L.t("Copy", "কপি করুন")) { _, _ ->
+                val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                cm.setPrimaryClip(ClipData.newPlainText("PowerLock diagnostics", report))
+                Toast.makeText(this, L.t("Copied", "কপি হয়েছে"), Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton(L.t("Close", "বন্ধ"), null)
+            .show()
+    }
+    row.addView(viewBtn, lp(0, WRAP, r = dp(8), weight = 1f))
+    val clearBtn = outlineBtn(L.t("Clear", "মুছুন"), C.primary)
+    clearBtn.setOnClickListener {
+        Diag.clear(this)
+        Toast.makeText(this, L.t("Log cleared", "লগ মুছে ফেলা হয়েছে"), Toast.LENGTH_SHORT).show()
+        go(3)
     }
     row.addView(clearBtn, lp(0, WRAP, weight = 1f))
     c.addView(row)
