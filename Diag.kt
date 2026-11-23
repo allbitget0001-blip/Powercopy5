@@ -197,6 +197,31 @@ object Diag {
     }
 
     /**
+     * Build 72: re-snapshot the previous run's stored crash + trail when
+     * this process has no snapshot yet. init() snapshots only once per
+     * process, so when the process survives the activity closing (the
+     * foreground service keeps it alive) a first launch with no stored
+     * data leaves prevReport null forever — and takePreviousReport()
+     * can never fire, even though the closed run's trail is sitting in
+     * SharedPreferences. Called from MainActivity.onCreate right after
+     * init() and before the first crumb of the new run, so the stored
+     * trail is captured before the new run's crumbs overwrite it. A
+     * no-op when a snapshot already exists (cold start) or when nothing
+     * is stored yet. When it builds a fresh snapshot it resets
+     * prevTaken, so the fresh snapshot can be taken. Never throws.
+     */
+    fun refreshSnapshotIfEmpty(ctx: Context) {
+        try {
+            synchronized(lock) {
+                if (prevReport != null) return
+                snapshotPrevious(ctx.applicationContext)
+                if (prevReport != null) prevTaken = false
+            }
+        } catch (_: Throwable) {
+        }
+    }
+
+    /**
      * Take the previous run's report for the launch auto-copy: returns it
      * once per process, then null — so an activity recreation (rotation)
      * never copies or toasts twice. Null when the previous run left

@@ -88,6 +88,7 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         Diag.init(this) // backstop: App.onCreate already installed the handler
+        Diag.refreshSnapshotIfEmpty(this) // build 72: the process may have survived the last close — re-read the stored trail before this run's first crumb overwrites it
         Diag.crumb("MainActivity.onCreate start")
         L.load(this)
         C.load(this)
