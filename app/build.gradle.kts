@@ -31,7 +31,7 @@ android {
         applicationId = "com.powerlock.app"
         minSdk = 26
         targetSdk = 34
-        versionCode = 21
+        versionCode = 22
         versionName = "3.0"
     }
 
@@ -64,11 +64,6 @@ dependencies {
     implementation("androidx.work:work-runtime:2.9.0")
     // FileProvider for sharing the focus card image (androidx.core)
     implementation("androidx.core:core-ktx:1.13.1")
-    // Native map (MapLibre Android SDK) — replaces the WebView + unpkg CDN map.
-    // Version 11.8.8 verified on Maven Central (latest stable 11.x, May 2025).
-    implementation("org.maplibre.gl:android-sdk:11.8.8")
-    // GeoJSON types for the map (FeatureCollection.fromJson) — the SDK's own
-    // compile dependency, declared explicitly so the classes are on the classpath.
-    // Version 6.0.1 verified on Maven Central (the SDK 11.8.x compile dependency).
-    implementation("org.maplibre.gl:android-sdk-geojson:6.0.1")
+    // NOTE: the map is the online WebView + MapLibre GL JS version (build 67) —
+    // no native map SDK dependency. The map JS loads from the unpkg CDN at runtime.
 }

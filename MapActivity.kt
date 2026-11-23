@@ -4,11 +4,6 @@ import android.Manifest
 import android.app.Activity
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
-import android.graphics.Bitmap
-import android.graphics.Canvas
-import android.graphics.Color
-import android.graphics.Paint
-import android.graphics.Path
 import android.location.Location
 import android.location.LocationManager
 import android.os.Bundle
@@ -17,6 +12,10 @@ import android.os.Looper
 import android.util.Log
 import android.view.Gravity
 import android.view.View
+import android.webkit.JavascriptInterface
+import android.webkit.WebChromeClient
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.SeekBar
@@ -24,52 +23,20 @@ import android.widget.TextView
 import android.widget.Toast
 import org.json.JSONArray
 import org.json.JSONObject
-import org.maplibre.android.MapLibre
-import org.maplibre.geojson.FeatureCollection
-import org.maplibre.android.annotations.Icon
-import org.maplibre.android.annotations.IconFactory
-import org.maplibre.android.annotations.Marker
-import org.maplibre.android.annotations.MarkerOptions
-import org.maplibre.android.camera.CameraPosition
-import org.maplibre.android.camera.CameraUpdateFactory
-import org.maplibre.android.geometry.LatLng
-import org.maplibre.android.geometry.LatLngBounds
-import org.maplibre.android.maps.MapLibreMap
-import org.maplibre.android.maps.MapView
-import org.maplibre.android.maps.Style
-import org.maplibre.android.style.layers.FillLayer
-import org.maplibre.android.style.layers.LineLayer
-import org.maplibre.android.style.layers.PropertyFactory.fillColor
-import org.maplibre.android.style.layers.PropertyFactory.fillOpacity
-import org.maplibre.android.style.layers.PropertyFactory.lineColor
-import org.maplibre.android.style.layers.PropertyFactory.lineOpacity
-import org.maplibre.android.style.layers.PropertyFactory.lineWidth
-import org.maplibre.android.style.sources.GeoJsonSource
 
 // =====================================================================
 // MAP for the location lock (Settings > Location lock > "ম্যাপ খুলুন").
 //
-// Native MapLibre Android SDK — no WebView, no remote code. The map style
-// is built in code (companion object below); only raster tile IMAGES are
-// fetched, from OpenStreetMap (map) or Esri (satellite), with attribution
-// shown by the SDK's attribution control. No lock/place/user data is sent
-// anywhere. Tiles are cached on disk by the SDK, so repeat views of the
-// same area don't re-fetch. Map tiles need internet; the lock itself works
-// offline on GPS.
+// WebView + MapLibre GL JS + CARTO Positron (Google-like, no API key, no new dependency).
+// Map tiles need internet; the lock itself works offline on GPS.
+// All buttons/panels are native Android views, only the map is a WebView.
+// Build 67: back to this online map — the native MapLibre SDK (build 65) was
+// removed to shrink the APK. The map JS loads from the unpkg CDN at runtime.
 // =====================================================================
 
 class MapActivity : Activity() {
 
-    companion object {
-        // Styles built in code — never fetched from the internet.
-        private const val OSM_STYLE_JSON = "{\"version\":8,\"sources\":{\"osm\":{\"type\":\"raster\",\"tiles\":[\"https://tile.openstreetmap.org/{z}/{x}/{y}.png\"],\"tileSize\":256,\"attribution\":\"© OpenStreetMap contributors\"}},\"layers\":[{\"id\":\"osm\",\"type\":\"raster\",\"source\":\"osm\",\"minzoom\":0,\"maxzoom\":19}]}"
-        private const val SAT_STYLE_JSON = "{\"version\":8,\"sources\":{\"esri\":{\"type\":\"raster\",\"tiles\":[\"https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}\"],\"tileSize\":256,\"attribution\":\"Esri, Maxar, Earthstar Geographics\"}},\"layers\":[{\"id\":\"esri\",\"type\":\"raster\",\"source\":\"esri\",\"minzoom\":0,\"maxzoom\":19}]}"
-    }
-
-    private lateinit var mapView: MapView
-    private var map: MapLibreMap? = null
-    private var style: Style? = null
-    private var styleReady = false
+    private lateinit var web: WebView
     private lateinit var bannerTv: TextView
     private lateinit var nameTv: TextView
     private lateinit var distTv: TextView
@@ -85,23 +52,15 @@ class MapActivity : Activity() {
     private var satOn = false
     private var routeDayOffset = 0 // 0 = today, 1 = yesterday, ... up to 29
 
+    private var pageReady = false
+    private val pendingJs = ArrayList<String>()
     private val handler = Handler(Looper.getMainLooper())
 
     private var places = ArrayList<Place>()
     private var selectedId: Long? = null
     private var pendingLat: Double? = null
     private var pendingLng: Double? = null
-    private var pendingRadius = 200
-    private var displayRadius: Int? = null // live slider preview for the selected place (saved only on Save)
     private var meLoc: Location? = null
-    private var lastMarkerTapMs = 0L // a marker tap must not also drop a pending pin
-
-    private val placeMarkers = HashMap<Long, Marker>()
-    private val placeMarkerColors = HashMap<Long, Int>()
-    private var meMarker: Marker? = null
-    private var pendingMarker: Marker? = null
-    private val pinIcons = HashMap<Int, Icon>()
-    private var meDotIconCached: Icon? = null
 
     private var editRadius = 200
     private var editMode = PLACE_MODE_INSIDE
@@ -119,11 +78,30 @@ class MapActivity : Activity() {
         }
     }
 
+    // ---- JS bridge: called from the MapLibre map ----------------------
+
+    inner class MapBridge {
+        @JavascriptInterface
+        fun onMapTap(lat: Double, lng: Double) {
+            runOnUiThread {
+                pendingLat = lat
+                pendingLng = lng
+                selectedId = null
+                pushPendingJs()
+                updatePanel()
+            }
+        }
+
+        @JavascriptInterface
+        fun onPlaceTap(id: Long) {
+            runOnUiThread { selectPlace(id) }
+        }
+    }
+
     // ---- lifecycle ------------------------------------------------------
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        MapLibre.getInstance(this)
         L.load(this)
         C.load(this)
         places = ArrayList(Extra.places(this))
@@ -151,21 +129,29 @@ class MapActivity : Activity() {
         head.addView(satBtn)
         root.addView(head)
 
-        mapView = MapView(this)
-        mapView.onCreate(savedInstanceState)
-        root.addView(mapView, lp(MATCH, 0, weight = 1f))
-        mapView.getMapAsync { m ->
-            map = m
-            val cLat = meLoc?.latitude ?: places.firstOrNull { it.enabled }?.lat ?: 23.8103
-            val cLng = meLoc?.longitude ?: places.firstOrNull { it.enabled }?.lng ?: 90.4125
-            m.cameraPosition = CameraPosition.Builder().target(LatLng(cLat, cLng)).zoom(15.0).build()
-            m.addOnMapClickListener { point ->
-                onMapTap(point)
-                true
+        web = WebView(this)
+        web.settings.javaScriptEnabled = true
+        web.settings.domStorageEnabled = true
+        web.webChromeClient = WebChromeClient()
+        web.addJavascriptInterface(MapBridge(), "Android")
+        web.webViewClient = object : WebViewClient() {
+            override fun onPageFinished(view: WebView?, url: String?) {
+                pageReady = true
+                for (js in pendingJs) {
+                    try {
+                        web.evaluateJavascript(js, null)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "map js failed", e)
+                    }
+                }
+                pendingJs.clear()
+                pushDataJs()
+                pushMeJs()
+                updateRouteDay()
             }
-            m.setOnMarkerClickListener { marker -> onMarkerTap(marker) }
-            applyStyle()
         }
+        root.addView(web, lp(MATCH, 0, weight = 1f))
+        web.loadDataWithBaseURL("https://unpkg.com", mapHtml(), "text/html", "utf-8", null)
 
         // ---- bottom panel (native Android views) ----
         val panel = LinearLayout(this)
@@ -288,43 +274,32 @@ class MapActivity : Activity() {
         refreshTick()
     }
 
-    override fun onStart() {
-        super.onStart()
-        if (::mapView.isInitialized) mapView.onStart()
-    }
-
     override fun onResume() {
         super.onResume()
-        if (::mapView.isInitialized) mapView.onResume()
+        try {
+            web.onResume()
+        } catch (e: Exception) {
+        }
         handler.removeCallbacks(tick)
         handler.post(tick)
     }
 
     override fun onPause() {
         handler.removeCallbacks(tick)
-        if (::mapView.isInitialized) mapView.onPause()
+        try {
+            web.onPause()
+        } catch (e: Exception) {
+        }
         super.onPause()
-    }
-
-    override fun onStop() {
-        if (::mapView.isInitialized) mapView.onStop()
-        super.onStop()
     }
 
     override fun onDestroy() {
         handler.removeCallbacks(tick)
-        if (::mapView.isInitialized) mapView.onDestroy()
+        try {
+            web.destroy()
+        } catch (e: Exception) {
+        }
         super.onDestroy()
-    }
-
-    override fun onLowMemory() {
-        super.onLowMemory()
-        if (::mapView.isInitialized) mapView.onLowMemory()
-    }
-
-    override fun onSaveInstanceState(outState: Bundle) {
-        super.onSaveInstanceState(outState)
-        if (::mapView.isInitialized) mapView.onSaveInstanceState(outState)
     }
 
     override fun onRequestPermissionsResult(code: Int, perms: Array<String>, res: IntArray) {
@@ -356,14 +331,16 @@ class MapActivity : Activity() {
     private fun refreshTick() {
         meLoc = lastKnown()
         updatePanel()
-        updateRouteDay() // label + renderAll()
+        pushMeJs()
+        pushDataJs()
+        updateRouteDay()
     }
 
-    /** Switch between the OSM map and the Esri satellite style. */
+    /** Switch the MapLibre style between Positron map and Esri satellite. */
     private fun toggleSat() {
         satOn = !satOn
         satBtn.text = if (satOn) "🗺 " + L.t("Map", "ম্যাপ") else "🛰 " + L.t("Satellite", "স্যাটেলাইট")
-        applyStyle()
+        eval("setSat(" + satOn + ");")
     }
 
     private fun recenterOnMe() {
@@ -374,24 +351,22 @@ class MapActivity : Activity() {
             } else {
                 meLoc = loc
                 updatePanel()
-                renderAll()
-                try {
-                    map?.animateCamera(CameraUpdateFactory.newLatLngZoom(LatLng(loc.latitude, loc.longitude), 16.0))
-                } catch (e: Exception) {
-                    Log.e(TAG, "map recenter failed", e)
-                }
+                pushMeJs()
+                eval("recenter(" + loc.latitude + "," + loc.longitude + ");")
             }
         }
     }
 
-    /** Is this place demanding protection right now? Null when location is unknown/untrusted. */
-    private fun placeActive(pl: Place): Boolean? {
+    /** Is this place demanding protection right now? Null when location is unknown/untrusted.
+     * [radius] defaults to the saved radius; the map preview passes the edited radius
+     * so the circle colour matches the circle being drawn. */
+    private fun placeActive(pl: Place, radius: Int = pl.radius): Boolean? {
         val me = meLoc ?: return null
         if (me.hasAccuracy() && me.accuracy > 200f) return null
         val res = FloatArray(1)
         Location.distanceBetween(me.latitude, me.longitude, pl.lat, pl.lng, res)
         val d = res[0]
-        return if (pl.mode == PLACE_MODE_OUTSIDE) d > pl.radius * 1.3f else d <= pl.radius
+        return if (pl.mode == PLACE_MODE_OUTSIDE) d > radius * 1.3f else d <= radius
     }
 
     private fun distTo(pl: Place): Float? {
@@ -466,13 +441,12 @@ class MapActivity : Activity() {
         selectedId = id
         pendingLat = null
         pendingLng = null
-        displayRadius = null
         editRadius = pl.radius
         editMode = pl.mode
         syncEditControls()
         updatePanel()
-        renderAll()
-        if (editRadius > 2000) fitCircle(pl.lat, pl.lng, editRadius)
+        pushDataJs()
+        if (editRadius > 2000) eval("fitCircle(" + pl.lat + "," + pl.lng + "," + editRadius + ");")
     }
 
     private fun syncEditControls() {
@@ -486,19 +460,17 @@ class MapActivity : Activity() {
     private fun setEditRadius(r: Int) {
         editRadius = r.coerceIn(50, 10000)
         syncEditControls()
-        pendingRadius = editRadius
         val id = selectedId ?: return
         val pl = places.find { it.id == id } ?: return
-        displayRadius = editRadius
-        renderAll()
-        if (editRadius > 2000) fitCircle(pl.lat, pl.lng, editRadius)
+        eval("updateCircle(" + id + "," + editRadius + "," + (placeActive(pl, editRadius) == true) + ");")
+        if (editRadius > 2000) eval("fitCircle(" + pl.lat + "," + pl.lng + "," + editRadius + ");")
     }
 
     private fun setEditMode(m: Int) {
         editMode = m
         syncEditControls()
         updatePanel()
-        renderAll()
+        pushDataJs()
     }
 
     private fun saveSelected() {
@@ -506,13 +478,12 @@ class MapActivity : Activity() {
         val idx = places.indexOfFirst { it.id == id }
         if (idx < 0) return
         places[idx] = places[idx].copy(radius = editRadius, mode = editMode)
-        displayRadius = null
         Extra.savePlaces(this, places)
         PlaceWatcher.sync(this)
         PlaceWatcher.checkNow(this)
         toast(L.t("Saved", "সংরক্ষণ হয়েছে"))
         updatePanel()
-        renderAll()
+        pushDataJs()
     }
 
     private fun deleteSelected() {
@@ -530,12 +501,11 @@ class MapActivity : Activity() {
                 }
                 places.removeAll { it.id == id }
                 selectedId = null
-                displayRadius = null
                 Extra.savePlaces(this, places)
                 PlaceWatcher.sync(this)
                 PlaceWatcher.checkNow(this)
                 updatePanel()
-                renderAll()
+                pushDataJs()
             }
             .setNegativeButton(L.t("Cancel", "বাতিল"), null)
             .show()
@@ -560,6 +530,8 @@ class MapActivity : Activity() {
             if (name.isEmpty()) {
                 nameEt.error = L.t("Enter a name", "নাম লিখুন")
             } else {
+                // Monotonic unique id (two places saved in the same millisecond
+                // must not share an id — System.currentTimeMillis() can collide).
                 val id = Store.newId()
                 val pl = Place(id, name, lat, lng, editRadius, 0, true, editMode)
                 places.add(pl)
@@ -573,6 +545,57 @@ class MapActivity : Activity() {
                 toast(L.t("Saved", "সংরক্ষণ হয়েছে"))
             }
         }
+    }
+
+    // ---- JS calls -----------------------------------------------------------
+
+    private fun eval(js: String) {
+        if (pageReady) {
+            try {
+                web.evaluateJavascript(js, null)
+            } catch (e: Exception) {
+                Log.e(TAG, "map js failed", e)
+            }
+        } else {
+            pendingJs.add(js)
+        }
+    }
+
+    private fun pushDataJs() {
+        val arr = JSONArray()
+        for (pl in places) {
+            val o = JSONObject()
+            o.put("id", pl.id)
+            o.put("name", pl.name)
+            o.put("lat", pl.lat)
+            o.put("lng", pl.lng)
+            // Live slider preview: while a place is selected, send the edited
+            // radius — otherwise the 5 s tick would snap the circle back to the
+            // saved radius while the user is still dragging the slider.
+            val effR = if (pl.id == selectedId) editRadius else pl.radius
+            o.put("r", effR)
+            o.put("active", placeActive(pl, effR) == true)
+            arr.put(o)
+        }
+        val sel = selectedId ?: -1L
+        eval("setData($arr,$sel);")
+    }
+
+    private fun pushMeJs() {
+        val me = meLoc ?: return
+        eval("setMe(" + me.latitude + "," + me.longitude + ");")
+    }
+
+    /** Today's route as [[lat, lng], ...] for the map polyline (or the selected day). */
+    private fun pushRouteJs() {
+        val arr = JSONArray()
+        for (pt in Store.routeForDay(this, Store.dayKey(routeDayOffset))) {
+            val pair = JSONArray()
+            pair.put(pt.lat)
+            pair.put(pt.lng)
+            arr.put(pair)
+        }
+        eval("setRoute($arr);")
     }
 
     private fun stepRouteDay(delta: Int) {
@@ -602,301 +625,154 @@ class MapActivity : Activity() {
             }
         }
         routeDayTv.text = "$label: $distTxt"
-        renderAll()
+        pushRouteJs()
+    }
+
+    private fun pushPendingJs() {
+        val la = pendingLat
+        val lo = pendingLng
+        if (la != null && lo != null) eval("setPending(" + la + "," + lo + ");")
     }
 
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_LONG).show()
 
-    // ---- native map ---------------------------------------------------------
+    // ---- the map page (MapLibre GL JS + CARTO Positron, no API key) --------
 
-    /** Apply the current style (OSM map or Esri satellite); layers re-render on load. */
-    private fun applyStyle() {
-        val m = map ?: return
-        styleReady = false
-        style = null
-        val json = if (satOn) SAT_STYLE_JSON else OSM_STYLE_JSON
-        try {
-            m.setStyle(Style.Builder().fromJson(json)) { s ->
-                style = s
-                styleReady = true
-                renderAll()
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "map style failed", e)
-        }
-    }
-
-    /** Redraw everything: place circles, pending circle, route line, markers. */
-    private fun renderAll() {
-        val s = style ?: return
-        if (!styleReady) return
-        try {
-            renderPlaceLayers(s)
-            renderPendingLayer(s)
-            renderRouteLayer(s)
-            renderMarkers()
-        } catch (e: Exception) {
-            Log.e(TAG, "map render failed", e)
-        }
-    }
-
-    private fun renderPlaceLayers(s: Style) {
-        val activeFeats = JSONArray()
-        val inactiveFeats = JSONArray()
-        for (pl in places) {
-            val r = if (pl.id == selectedId) (displayRadius ?: pl.radius) else pl.radius
-            if (placeActive(pl) == true) activeFeats.put(circleFeature(pl.lat, pl.lng, r))
-            else inactiveFeats.put(circleFeature(pl.lat, pl.lng, r))
-        }
-        setGeoJsonSource(s, "places-active", featureCollection(activeFeats))
-        setGeoJsonSource(s, "places-inactive", featureCollection(inactiveFeats))
-        ensureFillLine(s, "places-active", "#22c55e")
-        ensureFillLine(s, "places-inactive", "#3b82f6")
-        // the selected place gets a thicker outline
-        val sel = places.find { it.id == selectedId }
-        val selFeats = JSONArray()
-        if (sel != null) selFeats.put(circleFeature(sel.lat, sel.lng, displayRadius ?: sel.radius))
-        setGeoJsonSource(s, "places-sel", featureCollection(selFeats))
-        val selColor = if (sel != null && placeActive(sel) == true) "#22c55e" else "#3b82f6"
-        if (s.getLayer("places-sel-line") == null) {
-            s.addLayer(LineLayer("places-sel-line", "places-sel").withProperties(lineColor(selColor), lineWidth(4f)))
-        } else {
-            (s.getLayer("places-sel-line") as? LineLayer)?.setProperties(lineColor(selColor))
-        }
-    }
-
-    private fun renderPendingLayer(s: Style) {
-        val la = pendingLat
-        val lo = pendingLng
-        val feats = JSONArray()
-        if (la != null && lo != null) feats.put(circleFeature(la, lo, pendingRadius))
-        setGeoJsonSource(s, "pending-circle", featureCollection(feats))
-        ensureFillLine(s, "pending-circle", "#FFB84D")
-    }
-
-    private fun renderRouteLayer(s: Style) {
-        val coords = JSONArray()
-        for (pt in Store.routeForDay(this, Store.dayKey(routeDayOffset))) {
-            val pair = JSONArray()
-            pair.put(pt.lng)
-            pair.put(pt.lat)
-            coords.put(pair)
-        }
-        val feats = JSONArray()
-        if (coords.length() >= 2) {
-            val geom = JSONObject()
-            geom.put("type", "LineString")
-            geom.put("coordinates", coords)
-            val feat = JSONObject()
-            feat.put("type", "Feature")
-            feat.put("properties", JSONObject())
-            feat.put("geometry", geom)
-            feats.put(feat)
-        }
-        setGeoJsonSource(s, "route-line", featureCollection(feats))
-        if (s.getLayer("route-line-layer") == null) {
-            s.addLayer(
-                LineLayer("route-line-layer", "route-line").withProperties(
-                    lineColor("#10b981"), lineWidth(4f), lineOpacity(0.9f)
-                )
-            )
-        }
-    }
-
-    private fun setGeoJsonSource(s: Style, id: String, geoJson: String) {
-        val existing = s.getSource(id) as? GeoJsonSource
-        if (existing != null) existing.setGeoJson(FeatureCollection.fromJson(geoJson))
-        else s.addSource(GeoJsonSource(id, geoJson))
-    }
-
-    private fun ensureFillLine(s: Style, srcId: String, color: String) {
-        if (s.getLayer("$srcId-fill") == null) {
-            s.addLayer(FillLayer("$srcId-fill", srcId).withProperties(fillColor(color), fillOpacity(0.15f)))
-        }
-        if (s.getLayer("$srcId-line") == null) {
-            s.addLayer(LineLayer("$srcId-line", srcId).withProperties(lineColor(color), lineWidth(2f)))
-        }
-    }
-
-    /** Place pins (green = locking, blue = not), pending pin (orange), me dot (blue). */
-    private fun renderMarkers() {
-        val m = map ?: return
-        val seen = HashSet<Long>()
-        for (pl in places) {
-            seen.add(pl.id)
-            val col = if (placeActive(pl) == true) Color.parseColor("#22c55e") else Color.parseColor("#3b82f6")
-            val existing = placeMarkers[pl.id]
-            if (existing != null && placeMarkerColors[pl.id] == col) {
-                existing.position = LatLng(pl.lat, pl.lng)
-            } else {
-                if (existing != null) m.removeMarker(existing)
-                val marker = m.addMarker(MarkerOptions().position(LatLng(pl.lat, pl.lng)).icon(pinIcon(col)))
-                placeMarkers[pl.id] = marker
-                placeMarkerColors[pl.id] = col
-            }
-        }
-        val dead = placeMarkers.keys.filter { it !in seen }
-        for (id in dead) {
-            val mk = placeMarkers[id]
-            if (mk != null) m.removeMarker(mk)
-            placeMarkers.remove(id)
-            placeMarkerColors.remove(id)
-        }
-        val pla = pendingLat
-        val plo = pendingLng
-        if (pla != null && plo != null) {
-            val pm = pendingMarker
-            if (pm != null) pm.position = LatLng(pla, plo)
-            else pendingMarker = m.addMarker(
-                MarkerOptions().position(LatLng(pla, plo)).icon(pinIcon(Color.parseColor("#f59e0b")))
-            )
-        } else if (pendingMarker != null) {
-            m.removeMarker(pendingMarker!!)
-            pendingMarker = null
-        }
+    private fun mapHtml(): String {
         val me = meLoc
-        if (me != null) {
-            val mm = meMarker
-            if (mm != null) mm.position = LatLng(me.latitude, me.longitude)
-            else meMarker = m.addMarker(MarkerOptions().position(LatLng(me.latitude, me.longitude)).icon(meDotIcon()))
-        } else if (meMarker != null) {
-            m.removeMarker(meMarker!!)
-            meMarker = null
-        }
-    }
-
-    /** Tap on the map: inside a place circle selects it (nearest centre wins), else drops a pending pin. */
-    private fun onMapTap(point: LatLng) {
-        if (System.currentTimeMillis() - lastMarkerTapMs < 300) return
-        var best: Place? = null
-        var bestD = Float.MAX_VALUE
-        for (pl in places) {
-            val res = FloatArray(1)
-            Location.distanceBetween(point.latitude, point.longitude, pl.lat, pl.lng, res)
-            if (res[0] <= pl.radius && res[0] < bestD) {
-                best = pl
-                bestD = res[0]
-            }
-        }
-        if (best != null) {
-            selectPlace(best.id)
-            return
-        }
-        pendingLat = point.latitude
-        pendingLng = point.longitude
-        selectedId = null
-        displayRadius = null
-        renderAll()
-        updatePanel()
-    }
-
-    private fun onMarkerTap(marker: Marker): Boolean {
-        lastMarkerTapMs = System.currentTimeMillis()
-        val id = placeMarkers.entries.firstOrNull { it.value == marker }?.key
-        if (id != null) selectPlace(id)
-        return true
-    }
-
-    /** Zoom the camera so a circle of the given radius fits the screen. */
-    private fun fitCircle(lat: Double, lng: Double, radiusM: Int) {
-        val m = map ?: return
-        try {
-            val dLat = radiusM / 111320.0
-            val dLng = radiusM / (111320.0 * Math.cos(Math.toRadians(lat)))
-            val bounds = LatLngBounds.Builder()
-                .include(LatLng(lat - dLat, lng - dLng))
-                .include(LatLng(lat + dLat, lng + dLng))
-                .build()
-            m.animateCamera(CameraUpdateFactory.newLatLngBounds(bounds, 30))
-        } catch (e: Exception) {
-            Log.e(TAG, "map fit failed", e)
-        }
-    }
-
-    // ---- GeoJSON helpers (org.json builds the strings; FeatureCollection parses them) -----
-
-    /** A 64-gon polygon approximating a circle of radiusM metres around (lat, lng). */
-    private fun circleFeature(lat: Double, lng: Double, radiusM: Int): JSONObject {
-        val ring = JSONArray()
-        val lat1 = Math.toRadians(lat)
-        val lng1 = Math.toRadians(lng)
-        for (i in 0..64) {
-            val b = i / 64.0 * 2 * Math.PI
-            val d = radiusM / 6371000.0
-            val lat2 = Math.asin(Math.sin(lat1) * Math.cos(d) + Math.cos(lat1) * Math.sin(d) * Math.cos(b))
-            val lng2 = lng1 + Math.atan2(Math.sin(b) * Math.sin(d) * Math.cos(lat1), Math.cos(d) - Math.sin(lat1) * Math.sin(lat2))
-            val pt = JSONArray()
-            pt.put(Math.toDegrees(lng2))
-            pt.put(Math.toDegrees(lat2))
-            ring.put(pt)
-        }
-        val coords = JSONArray()
-        coords.put(ring)
-        val geom = JSONObject()
-        geom.put("type", "Polygon")
-        geom.put("coordinates", coords)
-        val feat = JSONObject()
-        feat.put("type", "Feature")
-        feat.put("properties", JSONObject())
-        feat.put("geometry", geom)
-        return feat
-    }
-
-    private fun featureCollection(features: JSONArray): String {
-        val fc = JSONObject()
-        fc.put("type", "FeatureCollection")
-        fc.put("features", features)
-        return fc.toString()
-    }
-
-    // ---- marker icons (drawn in code — no drawable resources) -------------
-
-    /** A teardrop pin bitmap in the given ARGB colour (cached per colour). */
-    private fun pinIcon(color: Int): Icon {
-        val cached = pinIcons[color]
-        if (cached != null) return cached
-        val d = resources.displayMetrics.density
-        val w = (40 * d).toInt()
-        val h = (56 * d).toInt()
-        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        val cv = Canvas(bmp)
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG)
-        paint.style = Paint.Style.FILL
-        paint.color = color
-        val cx = w / 2f
-        val cy = h * 0.36f
-        val r = w * 0.36f
-        cv.drawCircle(cx, cy, r, paint)
-        val path = Path()
-        path.moveTo(cx - r * 0.72f, cy + r * 0.5f)
-        path.lineTo(cx + r * 0.72f, cy + r * 0.5f)
-        path.lineTo(cx, h * 0.97f)
-        path.close()
-        cv.drawPath(path, paint)
-        paint.color = Color.WHITE
-        cv.drawCircle(cx, cy, r * 0.45f, paint)
-        val icon = IconFactory.getInstance(this).fromBitmap(bmp)
-        pinIcons[color] = icon
-        return icon
-    }
-
-    /** The blue "you are here" dot. */
-    private fun meDotIcon(): Icon {
-        val cached = meDotIconCached
-        if (cached != null) return cached
-        val d = resources.displayMetrics.density
-        val size = (22 * d).toInt()
-        val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
-        val cv = Canvas(bmp)
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG)
-        paint.style = Paint.Style.FILL
-        val c = size / 2f
-        paint.color = Color.WHITE
-        cv.drawCircle(c, c, size * 0.48f, paint)
-        paint.color = Color.parseColor("#2563eb")
-        cv.drawCircle(c, c, size * 0.34f, paint)
-        val icon = IconFactory.getInstance(this).fromBitmap(bmp)
-        meDotIconCached = icon
-        return icon
+        val cLat = me?.latitude ?: places.firstOrNull { it.enabled }?.lat ?: 23.8103
+        val cLng = me?.longitude ?: places.firstOrNull { it.enabled }?.lng ?: 90.4125
+        return """
+<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css">
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<style>html,body,#map{height:100%;margin:0;padding:0;background:#E8E8E8;}
+.me-dot{width:18px;height:18px;border-radius:50%;background:#2563eb;border:3px solid #ffffff;box-shadow:0 0 0 2px rgba(37,99,235,.4);}
+.style-sw{position:absolute;top:10px;right:10px;z-index:5;background:#ffffff;border-radius:8px;box-shadow:0 1px 5px rgba(0,0,0,.3);overflow:hidden;font-family:sans-serif;}
+.style-sw button{display:block;width:100%;border:0;background:#fff;padding:8px 12px;font-size:13px;color:#333;text-align:left;}
+.style-sw button.on{background:#2563eb;color:#fff;}</style></head>
+<body><div id="map"></div>
+<div class="style-sw"><button id="sw-map" class="on" onclick="setStyleMode('positron')">🗺 ম্যাপ</button><button id="sw-sat" onclick="setStyleMode('satellite')">🛰 স্যাটেলাইট</button><button id="sw-osm" onclick="setStyleMode('osm')">🧭 OSM</button></div>
+<script>
+var POSITRON='https://basemaps.cartocdn.com/gl/positron-gl-style/style.json';
+var SAT_STYLE={version:8,sources:{esri:{type:'raster',tiles:['https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'],tileSize:256,attribution:'Esri, Maxar, Earthstar Geographics'}},layers:[{id:'esri',type:'raster',source:'esri',minzoom:0,maxzoom:19}]};
+var OSM_STYLE={version:8,sources:{osm:{type:'raster',tiles:['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],tileSize:256,attribution:'© OpenStreetMap contributors'}},layers:[{id:'osm',type:'raster',source:'osm',minzoom:0,maxzoom:19}]};
+var map=null;
+if(typeof maplibregl==='undefined'){ document.getElementById('map').innerHTML='<div style="padding:24px;font-family:sans-serif;color:#333">ম্যাপ লোড হয়নি — ইন্টারনেট চালু করে আবার খুলুন।</div>'; }
+else try{ map=new maplibregl.Map({container:'map',style:POSITRON,center:[__LNG__,__LAT__],zoom:15}); }catch(e){ document.getElementById('map').innerHTML='<div style="padding:24px;font-family:sans-serif;color:#333">এই ফোনের WebView-এ WebGL চালু নেই — ম্যাপ দেখা যাবে না।</div>'; }
+var placesData=[],selId=-1,mePos=null,pendingPos=null,pendingRadius=200,curStyle='positron',routeData=[];
+var placeMarkers=[],meMarker=null,pendingMarker=null,lastPlaceTapMs=0;
+function toRad(d){return d*Math.PI/180;}
+function toDeg(r){return r*180/Math.PI;}
+function circlePolygon(lat,lng,radiusM){
+  var pts=[],i,b,d,lat1=toRad(lat),lng1=toRad(lng);
+  for(i=0;i<=64;i++){
+    b=i/64*2*Math.PI; d=radiusM/6371000;
+    var lat2=Math.asin(Math.sin(lat1)*Math.cos(d)+Math.cos(lat1)*Math.sin(d)*Math.cos(b));
+    var lng2=lng1+Math.atan2(Math.sin(b)*Math.sin(d)*Math.cos(lat1),Math.cos(d)-Math.sin(lat1)*Math.sin(lat2));
+    pts.push([toDeg(lng2),toDeg(lat2)]);
+  }
+  return {type:'Polygon',coordinates:[pts]};
+}
+function placesGeo(){
+  var feats=[];
+  for(var i=0;i<placesData.length;i++){
+    var p=placesData[i];
+    feats.push({type:'Feature',properties:{id:p.id,color:p.active?'#22c55e':'#3b82f6'},geometry:circlePolygon(p.lat,p.lng,p.r)});
+  }
+  return {type:'FeatureCollection',features:feats};
+}
+function ensurePlaceLayers(){
+  if(!map.getSource('places-circles')){
+    map.addSource('places-circles',{type:'geojson',data:placesGeo()});
+    map.addLayer({id:'places-fill',type:'fill',source:'places-circles',paint:{'fill-color':['get','color'],'fill-opacity':0.15}});
+    map.addLayer({id:'places-line',type:'line',source:'places-circles',paint:{'line-color':['get','color'],'line-width':['case',['==',['get','id'],selId],4,2]}});
+  }else{
+    map.getSource('places-circles').setData(placesGeo());
+    if(map.getLayer('places-line')) map.setPaintProperty('places-line','line-width',['case',['==',['get','id'],selId],4,2]);
+  }
+}
+function ensurePendingLayer(){
+  if(!pendingPos) return;
+  var data={type:'FeatureCollection',features:[{type:'Feature',properties:{},geometry:circlePolygon(pendingPos[0],pendingPos[1],pendingRadius)}]};
+  if(!map.getSource('pending-circle')){
+    map.addSource('pending-circle',{type:'geojson',data:data});
+    map.addLayer({id:'pending-fill',type:'fill',source:'pending-circle',paint:{'fill-color':'#FFB84D','fill-opacity':0.15}});
+    map.addLayer({id:'pending-line',type:'line',source:'pending-circle',paint:{'line-color':'#FFB84D','line-width':2}});
+  }else map.getSource('pending-circle').setData(data);
+}
+function renderAll(){
+  if(!map||!map.isStyleLoaded()) return;
+  ensurePlaceLayers();
+  ensurePendingLayer();
+  renderRoute();
+  for(var i=0;i<placeMarkers.length;i++) placeMarkers[i].remove();
+  placeMarkers=[];
+  for(var j=0;j<placesData.length;j++){
+    (function(p){
+      var col=p.active?'#22c55e':'#3b82f6';
+      var m=new maplibregl.Marker({color:col}).setLngLat([p.lng,p.lat]).addTo(map);
+      m.getElement().addEventListener('click',function(ev){ev.stopPropagation();placeTap(p.id);});
+      placeMarkers.push(m);
+    })(placesData[j]);
+  }
+  if(pendingPos){
+    if(pendingMarker) pendingMarker.setLngLat([pendingPos[1],pendingPos[0]]);
+    else pendingMarker=new maplibregl.Marker({color:'#f59e0b'}).setLngLat([pendingPos[1],pendingPos[0]]).addTo(map);
+  }
+  if(mePos){
+    if(meMarker) meMarker.setLngLat([mePos[1],mePos[0]]);
+    else{var el=document.createElement('div');el.className='me-dot';meMarker=new maplibregl.Marker({element:el}).setLngLat([mePos[1],mePos[0]]).addTo(map);}
+  }
+}
+function placeTap(id){lastPlaceTapMs=Date.now();Android.onPlaceTap(id);}
+function setData(json,sid){placesData=json;selId=sid;renderAll();}
+function setMe(lat,lng){mePos=[lat,lng];renderAll();}
+function setPending(lat,lng){pendingPos=[lat,lng];renderAll();}
+function setRoute(coords){routeData=coords||[];renderRoute();}
+function renderRoute(){
+  if(!map||!map.isStyleLoaded()) return;
+  if(routeData.length<2){ if(map.getSource('route-line')) map.getSource('route-line').setData({type:'FeatureCollection',features:[]}); return; }
+  var line={type:'Feature',properties:{},geometry:{type:'LineString',coordinates:routeData.map(function(c){return [c[1],c[0]];})}};
+  if(!map.getSource('route-line')){
+    map.addSource('route-line',{type:'geojson',data:{type:'FeatureCollection',features:[line]}});
+    map.addLayer({id:'route-line',type:'line',source:'route-line',paint:{'line-color':'#10b981','line-width':4,'line-opacity':0.9}});
+  }else map.getSource('route-line').setData({type:'FeatureCollection',features:[line]});
+}
+function updateCircle(id,radius,active){
+  for(var i=0;i<placesData.length;i++){if(placesData[i].id===id){placesData[i].r=radius;placesData[i].active=active;}}
+  pendingRadius=radius;renderAll();
+}
+function recenter(lat,lng){if(map) map.flyTo({center:[lng,lat],zoom:16});}
+function fitCircle(lat,lng,radius){
+  if(!map) return;
+  var dLat=radius/111320,dLng=radius/(111320*Math.cos(toRad(lat)));
+  map.fitBounds([[lng-dLng,lat-dLat],[lng+dLng,lat+dLat]],{padding:30});
+}
+function setStyleMode(mode){
+  curStyle=mode;
+  var b1=document.getElementById('sw-map'),b2=document.getElementById('sw-sat'),b3=document.getElementById('sw-osm');
+  if(b1)b1.className=(mode==='positron')?'on':'';
+  if(b2)b2.className=(mode==='satellite')?'on':'';
+  if(b3)b3.className=(mode==='osm')?'on':'';
+  if(!map) return;
+  if(mode==='satellite') map.setStyle(SAT_STYLE);
+  else if(mode==='osm') map.setStyle(OSM_STYLE);
+  else map.setStyle(POSITRON);
+}
+function setSat(on){setStyleMode(on?'satellite':'positron');}
+if(map){
+  map.on('load',function(){renderAll();});
+  map.on('style.load',function(){renderAll();});
+  map.on('click',function(e){
+    if(Date.now()-lastPlaceTapMs<500)return;
+    var feats=[];
+    try{if(map.getLayer('places-fill')) feats=map.queryRenderedFeatures(e.point,{layers:['places-fill']});}catch(err){}
+    if(feats&&feats.length>0){placeTap(feats[0].properties.id);return;}
+    Android.onMapTap(e.lngLat.lat,e.lngLat.lng);
+  });
+}
+</script></body></html>
+""".replace("__LAT__", cLat.toString()).replace("__LNG__", cLng.toString())
     }
 }
