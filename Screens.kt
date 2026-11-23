@@ -131,6 +131,19 @@ class HomeScreen(private val a: MainActivity) {
         header.addView(pill)
         col.addView(header)
 
+        // ---- diagnostics: the previous run's crash line, on the first
+        // screen — the app may die seconds after launch, so the reason
+        // must be visible (and screenshot-able) with no navigation ----
+        val diagCard = a.card(16)
+        val prevCrashLine = Diag.previousCrashLine()
+        if (prevCrashLine != null) {
+            diagCard.addView(a.tv(L.t("Last crash", "শেষ ক্র্যাশ"), 12f, C.danger, 1))
+            diagCard.addView(a.tv(prevCrashLine, 13f, C.text), lp(MATCH, WRAP, t = a.dp(4)))
+        } else {
+            diagCard.addView(a.tv(L.t("No crash recorded", "কোনো ক্র্যাশ রেকর্ড হয়নি") + " · " + L.t("trail: ", "ধাপ: ") + L.num(Diag.previousTrailCount().toString()) + " " + L.t("events", "টি ঘটনা"), 13f, C.muted))
+        }
+        col.addView(diagCard, lp(MATCH, WRAP, t = a.dp(14)))
+
         warnBox = LinearLayout(a)
         warnBox.orientation = LinearLayout.VERTICAL
         col.addView(warnBox, lp(MATCH, WRAP, t = a.dp(14)))

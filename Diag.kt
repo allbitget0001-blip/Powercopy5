@@ -19,6 +19,11 @@ import java.util.Locale
  *   in memory and persisted on every event, so it survives a process death.
  * If the app closes by itself, the trail shows how far it got and the crash
  * record shows whether it died from an exception at all.
+ * - the previous run's crash + trail are snapshotted at init, before the
+ *   new run's first crumb overwrites the stored trail (build 71): the
+ *   snapshot is auto-copied to the clipboard on launch and shown on the
+ *   Home screen, so the log is reachable even when the app dies seconds
+ *   after opening and Settings can never be reached in time.
  *
  * Everything here is wrapped in try/catch (Throwable): diagnostics must
  * never crash the app they are watching.
@@ -39,6 +44,16 @@ object Diag {
     private val lock = Any()
     private val crumbs = ArrayList<String>()
 
+    // ---- previous-run snapshot (build 71) ----
+    // The first crumb of a new run overwrites the stored trail, so the
+    // previous run's crash + trail are snapshotted at init() — before any
+    // crumb of this run can persist — and held in memory for the launch
+    // auto-copy (MainActivity) and the Home crash line.
+    private var prevReport: String? = null
+    private var prevCrash: String? = null
+    private var prevTrail: String = ""
+    private var prevTaken = false
+
     /**
      * Install the crash handler (once) and remember the app context. Safe to
      * call from anywhere, any number of times. The installed flag is
@@ -52,6 +67,9 @@ object Diag {
                 if (appCtx == null) appCtx = app
                 if (installed) return
                 installed = true
+                // snapshot the previous run BEFORE any crumb of this run
+                // persists: the first crumb() overwrites the stored trail
+                snapshotPrevious(app)
             }
             val prev = Thread.getDefaultUncaughtExceptionHandler()
             Thread.setDefaultUncaughtExceptionHandler { thread, e ->
@@ -140,26 +158,91 @@ object Diag {
     /** Full report for copy/paste: build, device, last crash, breadcrumb trail. */
     fun fullReport(ctx: Context): String {
         return try {
-            val sb = StringBuilder()
-            sb.append("PowerLock 2 diagnostics\n")
-            sb.append("build: ${Extra.BUILD_ID}  version: $APP_VERSION\n")
-            sb.append("android: ${android.os.Build.VERSION.SDK_INT} (${android.os.Build.VERSION.RELEASE})  device: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}\n")
-            val crash = lastCrash(ctx)
-            sb.append("\n--- last crash ---\n")
-            sb.append(crash ?: "No crash recorded")
-            sb.append("\n\n--- startup trail ---\n")
-            val c = crumbsText(ctx)
-            sb.append(if (c.isEmpty()) "No events recorded" else c)
-            sb.append("\n")
-            sb.toString()
+            buildReport(lastCrash(ctx), crumbsText(ctx))
         } catch (_: Throwable) {
             "Diagnostics unavailable"
         }
     }
 
+    private fun buildReport(crash: String?, crumbs: String): String {
+        val sb = StringBuilder()
+        sb.append("PowerLock 2 diagnostics\n")
+        sb.append("build: ${Extra.BUILD_ID}  version: $APP_VERSION\n")
+        sb.append("android: ${android.os.Build.VERSION.SDK_INT} (${android.os.Build.VERSION.RELEASE})  device: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}\n")
+        sb.append("\n--- last crash ---\n")
+        sb.append(crash ?: "No crash recorded")
+        sb.append("\n\n--- startup trail ---\n")
+        sb.append(if (crumbs.isEmpty()) "No events recorded" else crumbs)
+        sb.append("\n")
+        return sb.toString()
+    }
+
+    /**
+     * Snapshot the previous run's stored crash + trail. Only meaningful
+     * data is kept: a stored crash, or a non-empty stored trail. Called
+     * once, from init(), before this run's first crumb can persist — and
+     * never allowed to throw, so a snapshot failure can never block the
+     * crash-handler install that follows it in init().
+     */
+    private fun snapshotPrevious(ctx: Context) {
+        try {
+            val crash = lastCrash(ctx)
+            val trail = crumbsText(ctx)
+            if (crash == null && trail.isEmpty()) return
+            prevCrash = crash
+            prevTrail = trail
+            prevReport = buildReport(crash, trail)
+        } catch (_: Throwable) {
+        }
+    }
+
+    /**
+     * Take the previous run's report for the launch auto-copy: returns it
+     * once per process, then null — so an activity recreation (rotation)
+     * never copies or toasts twice. Null when the previous run left
+     * nothing (first launch) or the report was already taken.
+     */
+    fun takePreviousReport(): String? {
+        return try {
+            synchronized(lock) {
+                if (prevTaken) return null
+                val r = prevReport ?: return null
+                prevTaken = true
+                r
+            }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    /** Previous run's crash exception line ("ExceptionClass: message"), or null when it did not crash. */
+    fun previousCrashLine(): String? {
+        return try {
+            // crash line 3 is "ExceptionClass: message" (lines 1-2 are time and thread)
+            prevCrash?.lines()?.getOrNull(2)?.take(MAX_CRUMB_LEN)
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    /** Previous run's startup-trail event count (0 when it left no trail). */
+    fun previousTrailCount(): Int {
+        return try {
+            if (prevTrail.isEmpty()) 0 else prevTrail.lines().size
+        } catch (_: Throwable) {
+            0
+        }
+    }
+
     fun clear(ctx: Context) {
         try {
-            synchronized(lock) { crumbs.clear() }
+            synchronized(lock) {
+                crumbs.clear()
+                prevReport = null
+                prevCrash = null
+                prevTrail = ""
+                prevTaken = false
+            }
             ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
                 .remove(KEY_CRASH).remove(KEY_CRUMBS).commit()
         } catch (_: Throwable) {

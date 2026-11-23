@@ -1,6 +1,9 @@
 package com.powerlock.app
 
 import android.app.Activity
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
@@ -88,6 +91,7 @@ class MainActivity : Activity() {
         Diag.crumb("MainActivity.onCreate start")
         L.load(this)
         C.load(this)
+        autoCopyPrevDiag() // build 71: a previous run's log, copied before the app can die again
         tab = savedInstanceState?.getInt("tab") ?: 0
 
         // Notifications: ask once per install. Re-asking on every cold start
@@ -212,6 +216,24 @@ class MainActivity : Activity() {
                     }
                 }
             }
+        }
+    }
+
+    /**
+     * Build 71: copy the previous run's diagnostic report to the clipboard
+     * (once per process). The app may die seconds after launch, so the user
+     * must not need to navigate anywhere: open, let it close, open again,
+     * paste the clipboard into chat. Fires only when the previous run left
+     * a crash or a trail; the Settings Diagnostics Clear action stops it.
+     */
+    private fun autoCopyPrevDiag() {
+        try {
+            val report = Diag.takePreviousReport() ?: return
+            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            cm.setPrimaryClip(ClipData.newPlainText("PowerLock diagnostics", report))
+            toast(L.t("Diagnostic log copied — paste it to Muse", "ডায়াগনস্টিক লগ কপি হয়েছে — Muse-কে পাঠিয়ে দিন"))
+        } catch (t: Throwable) {
+            Log.e(TAG, "diag auto-copy failed", t)
         }
     }
 
