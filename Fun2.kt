@@ -268,9 +268,15 @@ object Story {
         )
     )
 
-    /** Chapters unlocked so far: one per completed lock, max 10. */
-    fun unlockedCount(ctx: Context): Int =
-        Store.sessions(ctx).count { it.ok }.coerceAtMost(TOTAL)
+    /** Chapters unlocked so far: one per completed lock, max 10.
+     * Floored at the already-seen count: the sessions list is capped at 500
+     * entries, so without this 491+ consecutive broken locks would silently
+     * re-lock chapters. Reads the raw pref — seenCount() calls this on first
+     * read, so calling it here would recurse infinitely. */
+    fun unlockedCount(ctx: Context): Int {
+        val seen = Store.lock(ctx).getInt("story_seen", 0)
+        return maxOf(Store.sessions(ctx).count { it.ok }, seen).coerceAtMost(TOTAL)
+    }
 
     /**
      * Chapters the user has already been told about. Backfills silently on
@@ -389,10 +395,10 @@ object GardenAnimals {
     }
 
     /** The next animal to earn by growing trees, or null when all are earned. */
-    fun nextByTrees(ctx: Context): AnimalDef? {
-        val trees = treeCount(ctx)
-        return ALL.filter { trees < it.trees }.minByOrNull { it.trees }
-    }
+    fun nextByTrees(ctx: Context): AnimalDef? =
+        // locked() excludes wheel-won animals too: filtering ALL by trees
+        // alone could return an animal the user already owns via the wheel
+        locked(ctx).minByOrNull { it.trees }
 }
 
 /** Canvas-drawn garden animal (bird, butterfly, rabbit, fox). Simple shapes, no assets. */

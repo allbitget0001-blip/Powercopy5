@@ -351,7 +351,7 @@ object MiniGames {
         var finished = false
         var options = listOf(0, 0, 0, 0)
         var answer = 0
-        val startMs = System.currentTimeMillis()
+        val startMs = SystemClock.elapsedRealtime()
         val root = gameRoot(a)
         val status = a.tv("", 14f, C.muted)
         status.gravity = Gravity.CENTER
@@ -365,7 +365,7 @@ object MiniGames {
         fun nextRound() {
             if (round >= total) {
                 finished = true
-                val secs = (System.currentTimeMillis() - startMs) / 1000
+                val secs = (SystemClock.elapsedRealtime() - startMs) / 1000
                 question.text = L.t("Done!", "শেষ!")
                 status.text = L.t(
                     "Score: $score / $total in ${secs}s",

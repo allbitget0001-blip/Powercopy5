@@ -49,7 +49,7 @@ object FocusJourney {
 
     /** The milestone with this 0-based ordinal across all journeys. */
     fun milestoneAt(ordinal: Int): Milestone {
-        val idx = (ordinal % (MILESTONES.size - 1)) + 1
+        val idx = (ordinal.coerceAtLeast(0) % (MILESTONES.size - 1)) + 1
         return MILESTONES[idx]
     }
 

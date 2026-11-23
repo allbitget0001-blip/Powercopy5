@@ -1,10 +1,7 @@
 package com.powerlock.app
 
 import android.app.AlarmManager
-import android.app.Notification
-import android.app.NotificationChannel
 import android.app.NotificationManager
-import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
@@ -19,7 +16,7 @@ import org.json.JSONObject
 import java.util.Calendar
 import java.util.Locale
 
-const val APP_VERSION = "2.0 Premium"
+const val APP_VERSION = "3.0 Premium"
 const val TAG = "PowerLock"
 
 /** Longest allowed session: 15 days, in minutes. */
@@ -104,8 +101,9 @@ data class UsageSession(val pkg: String, val open: Long, val close: Long)
 fun dayIdx(c: Calendar): Int = (c.get(Calendar.DAY_OF_WEEK) + 5) % 7
 
 fun fmtMin(m: Int): String {
-    val h = m / 60
-    val mm = m % 60
+    val norm = ((m % 1440) + 1440) % 1440
+    val h = norm / 60
+    val mm = norm % 60
     val h12 = if (h % 12 == 0) 12 else h % 12
     val ap = if (h < 12) "AM" else "PM"
     return L.num(String.format(Locale.US, "%d:%02d %s", h12, mm, ap))
@@ -155,7 +153,7 @@ fun fmtDate(ms: Long): String {
 fun statusOf(ctx: Context, active: Boolean, now: Long): PStatus {
     if (active) return PStatus.ACTIVE
     val last = Store.lock(ctx).getLong("lastDone", 0)
-    if (last > 0 && now - last < 30 * 60_000L) return PStatus.COMPLETED
+    if (last > 0 && now - last in 0 until 30 * 60_000L) return PStatus.COMPLETED
     if (Scheduler.nextStart(ctx, now) != null) return PStatus.SCHEDULED
     return PStatus.READY
 }
@@ -231,8 +229,13 @@ object Dnd {
                 return
             }
             val p = Store.lock(ctx)
-            if (!p.contains("dnd_prev")) {
-                p.edit().putInt("dnd_prev", nm.currentInterruptionFilter).apply()
+            // refresh the saved mode whenever the current one is not our own
+            // ALARMS-only state: a failed restore leaves a stale dnd_prev,
+            // and the next lock would otherwise restore that old mode over
+            // a manual change the user made in the meantime
+            val cur = nm.currentInterruptionFilter
+            if (!p.contains("dnd_prev") || cur != NotificationManager.INTERRUPTION_FILTER_ALARMS) {
+                p.edit().putInt("dnd_prev", cur).apply()
             }
             nm.setInterruptionFilter(NotificationManager.INTERRUPTION_FILTER_ALARMS)
         } catch (e: Exception) {
@@ -310,7 +313,7 @@ object FocusScore {
         if (startAgo < 0) return 0
         var streak = 0
         var i = startAgo
-        while (hasDay(i)) {
+        while (i < 3650 && hasDay(i)) {
             streak++
             i++
         }
@@ -522,6 +525,11 @@ object Store {
     // (strictly increasing within the process — two calls can never return
     // the same value, even in the same millisecond).
     private var lastId = 0L
+    // Reentrancy guard for finalizeIfExpired: recording the session can
+    // re-enter it (addSession -> FocusScore -> isActive), which used to
+    // recurse without bound. @Synchronized is reentrant, so the flag — not
+    // the lock — is what stops the loop.
+    private var finalizing = false
     @Synchronized
     fun newId(): Long {
         val now = System.currentTimeMillis() * 1000
@@ -549,25 +557,32 @@ object Store {
     /** Records the session once when its time is over. Safe to call many times. */
     @Synchronized
     fun finalizeIfExpired(ctx: Context) {
+        if (finalizing) return
         val p = lock(ctx)
         if (!p.getBoolean("active", false)) return
         if (remainingMs(ctx) > 0) return
-        val now = System.currentTimeMillis()
-        val src = p.getString("src", "manual") ?: "manual"
-        addSession(ctx, Session(p.getLong("start", now), now, p.getLong("total", 0), true, src))
-        FocusTree.recordOutcome(ctx, true, now) // the lock completed: the tree survives
-        val e = p.edit().putBoolean("active", false).putLong("lastDone", now)
-        clearUnlock(e)
-        clearMono(e)
-        e.remove("s_profile_apps").remove("s_profile_name")
-        e.remove("pen_task_id").remove("pen_task")
-        e.apply()
-        Dnd.restore(ctx) // lock over: notifications come back
-        FocusSound.stop() // lock over: the focus sound stops
-        SiteBlock.sync(ctx) // lock over: the site-block VPN stops
-        LockWidget.refresh(ctx)
-        PlaceWatcher.sync(ctx) // no session left: stop watching unless the location lock needs it
-        kickService(ctx) // refresh the notification: the lock is off now
+        finalizing = true
+        try {
+            val now = System.currentTimeMillis()
+            val src = p.getString("src", "manual") ?: "manual"
+            addSession(ctx, Session(p.getLong("start", now), now, p.getLong("total", 0), true, src))
+            FocusTree.recordOutcome(ctx, true, now) // the lock completed: the tree survives
+            val e = p.edit().putBoolean("active", false).putLong("lastDone", now)
+            clearUnlock(e)
+            clearMono(e)
+            e.remove("s_profile_apps").remove("s_profile_name")
+            e.remove("pen_task_id").remove("pen_task")
+            e.apply()
+            Dnd.restore(ctx) // lock over: notifications come back
+            FocusSound.stop() // lock over: the focus sound stops
+            SiteBlock.sync(ctx) // lock over: the site-block VPN stops
+            LockWidget.refresh(ctx)
+            PlaceWatcher.sync(ctx) // no session left: stop watching unless the location lock needs it
+            kickService(ctx) // refresh the notification: the lock is off now
+            Scheduler.onAlarm(ctx) // a schedule window may be open now that this lock ended
+        } finally {
+            finalizing = false
+        }
     }
 
     /** The running session's unlock destination, or null for a time-only session. */
@@ -668,6 +683,7 @@ object Store {
      */
     @Synchronized
     fun startSession(ctx: Context, durationMs: Long, src: String, unlock: UnlockTarget?, mode: String, profileId: Long = -1L): Boolean {
+        if (durationMs <= 0) return false
         if (isActive(ctx)) return false
         val now = System.currentTimeMillis()
         val st = settings(ctx)
@@ -988,6 +1004,7 @@ object Store {
     }
 
     /** A place was entered: open a new event (only if none is open for it). */
+    @Synchronized
     fun recordEnter(ctx: Context, pl: Place) {
         val list = placeEvents(ctx).toMutableList()
         if (list.any { it.placeId == pl.id && it.outTime == 0L }) return
@@ -996,6 +1013,7 @@ object Store {
     }
 
     /** A place was left: close the open event for it. */
+    @Synchronized
     fun recordExit(ctx: Context, pl: Place) {
         val list = placeEvents(ctx).toMutableList()
         val idx = list.indexOfFirst { it.placeId == pl.id && it.outTime == 0L }
@@ -1004,6 +1022,7 @@ object Store {
         saveEvents(ctx, list)
     }
 
+    @Synchronized
     fun clearEvents(ctx: Context) {
         locData(ctx).edit().remove("events").apply()
     }
@@ -1029,13 +1048,17 @@ object Store {
     }
 
     private fun addSession(ctx: Context, s: Session) {
+        // a clock moved backwards can make the duration negative — clamp it
+        // here so every finalizer (time, location, penalty, manual stop)
+        // stores a sane value
+        val safe = s.copy(dur = s.dur.coerceAtLeast(0))
         // a corrupt stored list must never be overwritten with a fresh one —
         // the session is not recorded, but the lock's rewards still apply
         if (JsonGuard.isCorrupt(lock(ctx), "sessions")) {
             Log.e(TAG, "sessions corrupt, keeping stored value; session not recorded")
         } else {
             val list = sessions(ctx).toMutableList()
-            list.add(s)
+            list.add(safe)
             val trimmed = if (list.size > 500) list.subList(list.size - 500, list.size) else list
             val arr = JSONArray()
             for (x in trimmed) {
@@ -1152,7 +1175,7 @@ object Store {
         var streak = 0
         if (hasDay(0) || hasDay(1)) {
             var i = if (hasDay(0)) 0 else 1
-            while (hasDay(i)) {
+            while (i < 3650 && hasDay(i)) {
                 streak++
                 i++
             }
@@ -1350,14 +1373,19 @@ object Badges {
         return out
     }
 
-    /** Awards a badge the first time it is earned; sets the one-time dialog flag. */
+    /** Awards a badge the first time it is earned; queues its one-time dialog. */
     fun award(ctx: Context, id: String): Boolean {
         val got = earned(ctx)
         if (got.containsKey(id)) return false
         try {
             val obj = JSONObject(Store.lock(ctx).getString("badges", "{}"))
             obj.put(id, System.currentTimeMillis())
-            Store.lock(ctx).edit().putString("badges", obj.toString()).putString("badge_pending", id).apply()
+            // badge_pending is a comma-separated queue: several badges can be
+            // earned by one lock completion, and each must get its dialog
+            val queue = (Store.lock(ctx).getString("badge_pending", null)
+                ?.split(",")?.filter { it.isNotEmpty() } ?: emptyList()).toMutableList()
+            if (!queue.contains(id)) queue.add(id)
+            Store.lock(ctx).edit().putString("badges", obj.toString()).putString("badge_pending", queue.joinToString(",")).apply()
             return true
         } catch (e: Exception) {
             Log.e(TAG, "badge award failed", e)
@@ -1384,11 +1412,16 @@ object Badges {
 
     /** A freshly earned badge waiting for its one-time dialog, or null. */
     fun pending(ctx: Context): BadgeDef? {
-        val id = Store.lock(ctx).getString("badge_pending", null) ?: return null
+        val raw = Store.lock(ctx).getString("badge_pending", null) ?: return null
+        val id = raw.split(",").firstOrNull { it.isNotEmpty() } ?: return null
         return byId(id)
     }
 
     fun clearPending(ctx: Context) {
-        Store.lock(ctx).edit().remove("badge_pending").apply()
+        val raw = Store.lock(ctx).getString("badge_pending", null) ?: return
+        val rest = raw.split(",").filter { it.isNotEmpty() }.drop(1)
+        val e = Store.lock(ctx).edit()
+        if (rest.isEmpty()) e.remove("badge_pending") else e.putString("badge_pending", rest.joinToString(","))
+        e.apply()
     }
 }

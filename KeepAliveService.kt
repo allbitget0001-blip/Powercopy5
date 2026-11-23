@@ -16,6 +16,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.graphics.Color
 import android.os.Build
 import android.os.Bundle
@@ -188,6 +189,11 @@ class KeepAliveService : Service() {
             nm.createNotificationChannel(
                 NotificationChannel("powerlock_alert", "Boundary alerts", NotificationManager.IMPORTANCE_DEFAULT)
             )
+            // go foreground FIRST: refresh() does fallible work (Store,
+            // icon bitmaps) before its own startForeground, and any throw
+            // would leave the foreground promise unfulfilled -> the system
+            // kills the process ~10 s after a startForegroundService start
+            startFg(minimalNotification())
             refresh()
             handler.removeCallbacks(heartbeatTask)
             handler.post(heartbeatTask) // fresh heartbeat every 60s so the accessibility service can tell we are alive
@@ -207,6 +213,46 @@ class KeepAliveService : Service() {
 
     private fun openApp(): PendingIntent =
         PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+
+    /** Minimal placeholder notification (app name only): refresh() replaces
+     * its content at once. Built without the lazy icons, so it cannot throw. */
+    private fun minimalNotification(): Notification {
+        return Notification.Builder(this, "powerlock")
+            .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
+            .setOngoing(true)
+            .setContentIntent(openApp())
+            .build()
+    }
+
+    /**
+     * Goes foreground with the right type: on Android 14+ a location-type
+     * start throws SecurityException when location is not usable right now
+     * (no permission, or while-in-use only while the app is in the
+     * background), and the unfulfilled foreground promise kills the process
+     * ~10 s later. Fall back to specialUse, which never needs location.
+     * (A plain permission check cannot decide this: checkSelfPermission
+     * returns GRANTED even in the background.)
+     */
+    private fun startFg(notification: Notification) {
+        if (Build.VERSION.SDK_INT >= 29) {
+            var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            if (hasUsableLocation()) type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+            try {
+                startForeground(1, notification, type)
+            } catch (e: SecurityException) {
+                Log.w(TAG, "location-type foreground start refused, retrying specialUse", e)
+                startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            }
+        } else {
+            startForeground(1, notification)
+        }
+    }
+
+    /** Location is usable for a location-type foreground service: granted, and
+     * either background location is granted or the app is in the foreground. */
+    private fun hasUsableLocation(): Boolean {
+        return Perm.locationOn(this) && (Perm.backgroundLocationOn(this) || MainActivity.isForeground)
+    }
 
     private fun refresh() {
         handler.removeCallbacks(finishTask)
@@ -254,7 +300,7 @@ class KeepAliveService : Service() {
             b.setContentTitle(L.t("PowerLock 2 is ready", "PowerLock 2 প্রস্তুত"))
                 .setContentText(L.t("Protection is off", "প্রটেকশন বন্ধ আছে"))
         }
-        startForeground(1, b.build())
+        startFg(b.build())
         LockWidget.refresh(this) // the notification and the widget show the same state
     }
 

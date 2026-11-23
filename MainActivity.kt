@@ -69,6 +69,12 @@ class MainActivity : Activity() {
 
     private var lastWidgetRefresh = 0L
 
+    companion object {
+        /** True while the activity is in the foreground (onResume..onPause). */
+        @Volatile
+        var isForeground = false
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         L.load(this)
@@ -116,12 +122,14 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        isForeground = true
         handler.post(ticker)
         if (tab == 3) go(3, false) // refresh permission status after returning from system settings
         if (tab == 4) PowerBlockService.diagOpen = true // back on Protection: the Diagnostic card is visible
     }
 
     override fun onPause() {
+        isForeground = false
         handler.removeCallbacks(ticker)
         PowerBlockService.diagOpen = false // the app is in the background: no card is visible
         super.onPause()

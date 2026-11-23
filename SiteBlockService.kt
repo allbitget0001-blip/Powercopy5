@@ -138,7 +138,10 @@ class SiteBlockService : VpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> stopVpn()
-            else -> startVpn()
+            ACTION_START -> startVpn()
+            // START_STICKY restart delivers a null intent: only restart the
+            // VPN when a lock is actually running, otherwise stop
+            else -> if (SiteBlock.isOn(this) && Store.isActive(this) && SiteBlock.hasPermission(this)) startVpn() else stopSelf()
         }
         return START_STICKY
     }
@@ -341,15 +344,16 @@ class SiteBlockService : VpnService() {
     /** Forwards one DNS query to the upstream resolver and returns its answer
      * (or null on timeout). Each query gets its own socket: with several pool
      * threads forwarding at once, a shared socket could hand a reply to the
-     * wrong thread. The 4096-byte buffer fits EDNS-sized answers, so the
-     * TC-bit TCP retry is rarely needed (TCP is not carried by the tunnel). */
+     * wrong thread. The 65535-byte buffer fits the largest possible UDP DNS
+     * reply, so no answer is ever silently truncated (TCP is not carried
+     * by the tunnel). */
     private fun forwardDns(dns: ByteArray): ByteArray? {
         return try {
             DatagramSocket().use { sock ->
                 sock.soTimeout = 2500
                 val addr = InetAddress.getByName(UPSTREAM)
                 sock.send(DatagramPacket(dns, dns.size, addr, UPSTREAM_PORT))
-                val buf = ByteArray(4096)
+                val buf = ByteArray(65535)
                 val reply = DatagramPacket(buf, buf.size)
                 sock.receive(reply)
                 buf.copyOfRange(0, reply.length)

@@ -39,10 +39,10 @@ import android.widget.FrameLayout
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
-import android.widget.Switch
 import android.widget.TextView
 import java.io.File
 import java.io.FileOutputStream
+import java.util.Locale
 
 const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
 const val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
@@ -126,7 +126,7 @@ object C {
     }
 }
 
-fun tint(color: Int, alpha: Int): Int = (alpha shl 24) or (color and 0x00FFFFFF)
+fun tint(color: Int, alpha: Int): Int = (alpha.coerceIn(0, 255) shl 24) or (color and 0x00FFFFFF)
 
 fun Context.dp(v: Int): Int = (v * resources.displayMetrics.density + 0.5f).toInt()
 
@@ -168,8 +168,12 @@ object Wallpaper {
             val opts = BitmapFactory.Options().apply { inSampleSize = sample }
             val bmp = ctx.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts) }
                 ?: return false
-            FileOutputStream(file(ctx)).use { bmp.compress(Bitmap.CompressFormat.JPEG, 85, it) }
+            val ok = FileOutputStream(file(ctx)).use { bmp.compress(Bitmap.CompressFormat.JPEG, 85, it) }
             bmp.recycle()
+            if (!ok) {
+                file(ctx).delete()
+                return false
+            }
             true
         } catch (e: Exception) {
             Log.e(TAG, "wallpaper save failed", e)
@@ -227,7 +231,7 @@ fun Context.card(pad: Int = 16): LinearLayout {
 }
 
 fun Context.section(t: String): TextView {
-    val v = tv(t.uppercase(), 12f, C.primary, 1)
+    val v = tv(t.uppercase(Locale.ROOT), 12f, C.primary, 1)
     v.letterSpacing = 0.08f
     return v
 }
@@ -280,7 +284,7 @@ fun Context.bigButton(kind: Ic, label: String, fill: Int, fg: Int, stroke: Int =
     b.gravity = Gravity.CENTER
     b.background = withRipple(rounded(fill, dp(32).toFloat(), stroke, if (stroke != 0) dp(1) else 0))
     b.addView(IconView(this, kind, fg), lp(dp(24), dp(24), r = dp(10)))
-    val t = tv(label.uppercase(), 16f, fg, 1)
+    val t = tv(label.uppercase(Locale.ROOT), 16f, fg, 1)
     t.letterSpacing = 0.04f
     b.addView(t)
     b.isClickable = true
@@ -578,6 +582,7 @@ class RingView(ctx: Context) : View(ctx) {
     }
 
     fun animateTo(p: Float) {
+        if (!p.isFinite()) return
         // smooth continuous sweep: the 1 s tick feeds a new target every
         // second, so a linear 1 s animation flows into the next one with no
         // pause — no stepping, even on 24 h locks (tiny per-second moves)
@@ -872,6 +877,7 @@ class SegmentedControl(
     private val ev = ArgbEvaluator()
 
     init {
+        index = index.coerceIn(0, (n - 1).coerceAtLeast(0))
         background = rounded(C.chipFill, ctx.dp(18).toFloat(), C.border, ctx.dp(1))
         thumb.background = rounded(C.selFill, ctx.dp(14).toFloat(), C.primary, ctx.dp(1))
         addView(thumb, FrameLayout.LayoutParams(0, 0))
@@ -904,6 +910,7 @@ class SegmentedControl(
     }
 
     private fun select(i: Int) {
+        if (n == 0) return
         if (i == index) return
         val old = index
         index = i

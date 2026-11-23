@@ -77,6 +77,9 @@ class PowerBlockService : AccessibilityService() {
     @Volatile
     private var provisionalCheckRunning = false // a location check is running for the power menu
 
+    @Volatile
+    private var destroyed = false // set in cleanup(): a stale location callback must not act after it
+
     private var overlay: View? = null
     private var overlaySub: TextView? = null
     private var overlayAttached = false
@@ -133,6 +136,8 @@ class PowerBlockService : AccessibilityService() {
     private var lastMidnightCheck = 0L // throttles the midnight split check (once per 60 s)
     private var imePkg: String? = null
     private var imeCheckedAt = 0L
+    private var launcherPkg: String? = null
+    private var launcherResolved = false
     private var limitBlockActive = false // the overlay is up for a daily limit (no lock needed)
     private var blockMsg = "" // the user's own message on the block screen
 
@@ -182,6 +187,12 @@ class PowerBlockService : AccessibilityService() {
         // config, so it must not trigger a full state re-read (JSON parses)
         if (key == "kas_heartbeat") return@OnSharedPreferenceChangeListener
         readState()
+        // the lock may just have ended: re-check on the main thread, since
+        // taps on the overlay itself generate no accessibility event to
+        // trigger the hide in onAccessibilityEvent
+        handler.post {
+            if (isBlockOverlayAttached() && !protecting() && !limitBlockActive) hideBlockOverlay()
+        }
     }
     private val hideTask = Runnable { hideOverlay() }
     private val backAgain = Runnable { if (protecting()) performGlobalAction(GLOBAL_ACTION_BACK) }
@@ -212,6 +223,7 @@ class PowerBlockService : AccessibilityService() {
 
     override fun onServiceConnected() {
         super.onServiceConnected()
+        destroyed = false
         try {
             L.load(this)
             readState()
@@ -301,7 +313,10 @@ class PowerBlockService : AccessibilityService() {
             lastKeepAliveCheck = now
             if (!protecting()) return
             val hb = Store.lock(this).getLong("kas_heartbeat", 0)
-            if (System.currentTimeMillis() - hb < 90_000) return
+            // fail-safe: a clock-backward jump makes the age negative, which
+            // must not suppress revival of a dead keep-alive service
+            val age = System.currentTimeMillis() - hb
+            if (age in 0 until 90_000) return
             Store.kickService(this)
             KeepAliveService.restartSoon(this, 1000)
         } catch (e: Exception) {
@@ -331,7 +346,7 @@ class PowerBlockService : AccessibilityService() {
                 hideBlockOverlay()
             } else if (isBlockOverlayAttached() && e.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
                 !pkg.contains("systemui") && pkg != packageName && pkg != blockedPkg &&
-                pkg != currentImePackage()
+                pkg != currentImePackage() && !pkg.contains("permissioncontroller") && pkg != "android"
             ) {
                 hideBlockOverlay()
             }
@@ -363,7 +378,14 @@ class PowerBlockService : AccessibilityService() {
 
     private fun onSystemUi(e: AccessibilityEvent) {
         // 1) instant check from the event itself (no IPC at all)
-        val menu = looksLikePowerMenu(e) || menuFromNode(e)
+        val menu = if (e.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            looksLikePowerMenu(e) || menuFromNode(e)
+        } else {
+            // bare trigger text ("Restart" in a notification) is not the
+            // power menu: without a window-state change the text path
+            // counts only with node confirmation, so the node scan decides
+            menuFromNode(e)
+        }
         if (!menu) return
         if (protecting()) {
             block()
@@ -379,12 +401,18 @@ class PowerBlockService : AccessibilityService() {
         }
         showOverlay()
         provisionalCheckRunning = true
+        val checkStarted = SystemClock.uptimeMillis()
         PlaceWatcher.isAnyPlaceActiveNow(this) { active ->
             provisionalCheckRunning = false
+            if (destroyed) return@isAnyPlaceActiveNow
             if (active == true) {
                 Store.setLocProtecting(this, true)
-                block()
-            } else {
+                // stale answer: the power menu is long gone and the user is
+                // in another app — never press Back there
+                if (SystemClock.uptimeMillis() - checkStarted < 3000) block()
+            } else if (!protecting()) {
+                // a real block may have shown its own shield meanwhile:
+                // only release when nothing is protecting any more
                 hideOverlay()
             }
         }
@@ -444,8 +472,12 @@ class PowerBlockService : AccessibilityService() {
      */
     private fun onFullBlockedApp(e: AccessibilityEvent) {
         val pkg = e.packageName?.toString() ?: return
+        // the launcher, the keyboard and this app itself must never be
+        // blocked: a daily limit on the launcher traps the user on the
+        // home screen until midnight
+        if (pkg == packageName || pkg == currentImePackage() || pkg == defaultLauncherPackage()) return
         val now = SystemClock.uptimeMillis()
-        if (pkg == lastBlockPkg && now - lastBlockAt < 1000 && blockOverlayAttached) return
+        if (pkg == lastBlockPkg && now - lastBlockAt < 1000 && isBlockOverlayAttached()) return
         lastBlockPkg = pkg
         lastBlockAt = now
         limitBlockActive = false // a lock block, not a limit block
@@ -505,6 +537,19 @@ class PowerBlockService : AccessibilityService() {
             null
         }
         return imePkg
+    }
+
+    /** The default launcher package (resolved once, cached): it must never be blocked. */
+    private fun defaultLauncherPackage(): String? {
+        if (launcherResolved) return launcherPkg
+        launcherResolved = true
+        launcherPkg = try {
+            val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
+            packageManager.resolveActivity(intent, 0)?.activityInfo?.packageName
+        } catch (e: Exception) {
+            null
+        }
+        return launcherPkg
     }
 
     /**
@@ -579,6 +624,9 @@ class PowerBlockService : AccessibilityService() {
             usageDay = today
             usageToday.clear()
             usageToday.putAll(Extra.usageTodayAll(this))
+            // the day rolled over: a limit block from yesterday is stale —
+            // hide it instead of leaving "opens again tomorrow" up all day
+            if (limitBlockActive) hideBlockOverlay()
         } catch (e: Exception) {
             Log.e(TAG, "midnight check failed", e)
         }
@@ -629,6 +677,7 @@ class PowerBlockService : AccessibilityService() {
     private fun histAdd(pkg: String, openWall: Long, closeWall: Long) {
         if (closeWall <= openWall) return
         val list = histCached()
+        val sigBefore = histCacheSig
         list.add(UsageSession(pkg, openWall, closeWall))
         // mirror the stored prune/cap so the cache stays in sync with disk
         val cutoff = System.currentTimeMillis() - 7L * 24 * 60 * 60 * 1000
@@ -639,6 +688,12 @@ class PowerBlockService : AccessibilityService() {
         }
         Extra.saveHistoryEntries(this, list)
         histSigSync()
+        if (histCacheSig == sigBefore) {
+            // the write did not land (the stored list is corrupt, so the
+            // save refuses to overwrite it): drop the cache so the diverged
+            // in-memory entry stops being served — the next read reloads disk
+            histCache = null
+        }
     }
 
     /** Remove the newest entry if it matches pkg + open time (the 30 s merge). */
@@ -646,9 +701,17 @@ class PowerBlockService : AccessibilityService() {
         val list = histCached()
         val last = list.lastOrNull() ?: return false
         if (last.pkg != pkg || last.open != openWall) return false
+        val sigBefore = histCacheSig
         list.removeAt(list.size - 1)
         Extra.saveHistoryEntries(this, list)
         histSigSync()
+        if (histCacheSig == sigBefore) {
+            // the write did not land: the entry is still on disk, so the
+            // removal did not happen — drop the cache and report failure so
+            // the caller starts a fresh session instead of resuming
+            histCache = null
+            return false
+        }
         return true
     }
 
@@ -731,8 +794,12 @@ class PowerBlockService : AccessibilityService() {
     /** Daily-limit block: the same protection screen as a full block, until midnight. */
     private fun onLimitBlockedApp(e: AccessibilityEvent) {
         val pkg = e.packageName?.toString() ?: return
+        // the launcher, the keyboard and this app itself must never be
+        // blocked: a daily limit on the launcher traps the user on the
+        // home screen until midnight
+        if (pkg == packageName || pkg == currentImePackage() || pkg == defaultLauncherPackage()) return
         val now = SystemClock.uptimeMillis()
-        if (pkg == lastBlockPkg && now - lastBlockAt < 1000 && blockOverlayAttached) return
+        if (pkg == lastBlockPkg && now - lastBlockAt < 1000 && isBlockOverlayAttached()) return
         lastBlockPkg = pkg
         lastBlockAt = now
         limitBlockActive = true
@@ -1606,10 +1673,18 @@ class PowerBlockService : AccessibilityService() {
         return root
     }
 
+    /** True attach state of the power-menu shield, mirroring
+     * isBlockOverlayAttached(): the WindowManager is authoritative, the
+     * boolean flag is only a cache. */
+    private fun isOverlayAttached(): Boolean {
+        if (overlayAttached) return true
+        return try { overlay?.isAttachedToWindow == true } catch (_: Exception) { false }
+    }
+
     private fun showOverlay() {
         handler.removeCallbacks(hideTask)
         handler.postDelayed(hideTask, 1400)
-        if (overlayAttached) return // never more than one shield
+        if (isOverlayAttached()) return // never more than one shield
         try {
             val v = ensureOverlay()
             val sessionOn = Store.isActive(this)
@@ -1634,23 +1709,35 @@ class PowerBlockService : AccessibilityService() {
             overlayAttached = true
         } catch (ex: Exception) {
             Log.e(TAG, "showOverlay failed", ex)
-            overlayAttached = false
+            // reconcile: the add may have failed *because* the view is
+            // already attached — the flag follows the WindowManager
+            overlayAttached = try { overlay?.isAttachedToWindow == true } catch (_: Exception) { false }
         }
     }
 
     private fun hideOverlay() {
-        if (!overlayAttached) return
-        overlayAttached = false
+        if (!isOverlayAttached()) {
+            overlayAttached = false
+            return
+        }
+        val v = overlay
+        if (v == null) {
+            overlayAttached = false
+            return
+        }
         try {
-            val v = overlay ?: return
             val wm = getSystemService(WINDOW_SERVICE) as WindowManager
             wm.removeViewImmediate(v)
         } catch (ex: Exception) {
             Log.e(TAG, "hideOverlay failed", ex)
         }
+        // reconcile: only the WindowManager knows whether the shield is
+        // really gone — the flag follows it, never the other way round
+        overlayAttached = try { v.isAttachedToWindow } catch (_: Exception) { false }
     }
 
     private fun cleanup() {
+        destroyed = true
         flushUsageSlice()
         closeHistorySession(SystemClock.uptimeMillis())
         Store.flushRoutePoints(this) // persist any batched route points

@@ -2,6 +2,7 @@ package com.powerlock.app
 
 import android.Manifest
 import android.app.Activity
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.location.Location
@@ -16,6 +17,7 @@ import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.webkit.WebResourceRequest
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.SeekBar
@@ -135,6 +137,18 @@ class MapActivity : Activity() {
         web.webChromeClient = WebChromeClient()
         web.addJavascriptInterface(MapBridge(), "Android")
         web.webViewClient = object : WebViewClient() {
+            // the Android JS bridge is exposed to this WebView: never let it
+            // navigate away from the map page — external links open in the browser
+            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                val url = request?.url?.toString() ?: return true
+                if (url.startsWith("data:")) return false
+                try {
+                    startActivity(Intent(Intent.ACTION_VIEW, request.url))
+                } catch (_: Exception) {
+                }
+                return true
+            }
+
             override fun onPageFinished(view: WebView?, url: String?) {
                 pageReady = true
                 for (js in pendingJs) {
@@ -361,6 +375,7 @@ class MapActivity : Activity() {
      * [radius] defaults to the saved radius; the map preview passes the edited radius
      * so the circle colour matches the circle being drawn. */
     private fun placeActive(pl: Place, radius: Int = pl.radius): Boolean? {
+        if (!pl.enabled) return false
         val me = meLoc ?: return null
         if (me.hasAccuracy() && me.accuracy > 200f) return null
         val res = FloatArray(1)
@@ -441,8 +456,8 @@ class MapActivity : Activity() {
         selectedId = id
         pendingLat = null
         pendingLng = null
-        editRadius = pl.radius
-        editMode = pl.mode
+        editRadius = pl.radius.coerceIn(50, 10000)
+        editMode = if (pl.mode == PLACE_MODE_OUTSIDE) PLACE_MODE_OUTSIDE else PLACE_MODE_INSIDE
         syncEditControls()
         updatePanel()
         pushDataJs()
@@ -495,8 +510,15 @@ class MapActivity : Activity() {
             .setPositiveButton(L.t("Delete", "মুছুন")) { _, _ ->
                 // a place that is locking right now cannot be deleted while you are there:
                 // the watcher only clears the flag when you leave, so refuse while active
-                if (Store.isLocProtecting(this) && placeActive(pl) == true) {
-                    toast(L.t("This place is locking right now — it turns off when you leave.", "এই জায়গায় এখন লক চলছে — জায়গা ছেড়ে গেলে নিজে নিজে বন্ধ হবে।"))
+                // — and also when the state is unknown (null): deleting blind could
+                // leave loc_protecting on with no place to clear it
+                val active = placeActive(pl)
+                if (Store.isLocProtecting(this) && active != false) {
+                    if (active == null) {
+                        toast(L.t("Location unavailable — turn on GPS.", "অবস্থান পাওয়া যাচ্ছে না — GPS চালু করুন।"))
+                    } else {
+                        toast(L.t("This place is locking right now — it turns off when you leave.", "এই জায়গায় এখন লক চলছে — জায়গা ছেড়ে গেলে নিজে নিজে বন্ধ হবে।"))
+                    }
                     return@setPositiveButton
                 }
                 places.removeAll { it.id == id }
@@ -533,7 +555,10 @@ class MapActivity : Activity() {
                 // Monotonic unique id (two places saved in the same millisecond
                 // must not share an id — System.currentTimeMillis() can collide).
                 val id = Store.newId()
-                val pl = Place(id, name, lat, lng, editRadius, 0, true, editMode)
+                // new places start at the default 200 m INSIDE: the add dialog
+                // has no radius/mode controls, so editRadius/editMode (leftover
+                // state from the last selected place) must not leak in here
+                val pl = Place(id, name, lat, lng, 200, 0, true, PLACE_MODE_INSIDE)
                 places.add(pl)
                 Extra.savePlaces(this, places)
                 PlaceWatcher.sync(this)

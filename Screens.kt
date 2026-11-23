@@ -1597,8 +1597,11 @@ class HomeScreen(private val a: MainActivity) {
                 ) + profTxt + extra
             )
             .setPositiveButton(L.t("Start", "শুরু করুন")) { _, _ ->
-                Store.startSession(a, ms, "manual", null, UNLOCK_TIME, profileId)
-                a.toast(L.t("Protection started", "প্রটেকশন শুরু হয়েছে"))
+                if (Store.startSession(a, ms, "manual", null, UNLOCK_TIME, profileId)) {
+                    a.toast(L.t("Protection started", "প্রটেকশন শুরু হয়েছে"))
+                } else {
+                    a.toast(L.t("A lock is already running", "একটা লক ইতিমধ্যে চলছে"))
+                }
                 tick()
             }
             .setNegativeButton(L.t("Cancel", "বাতিল"), null)
@@ -1644,10 +1647,13 @@ class HomeScreen(private val a: MainActivity) {
             .setPositiveButton(L.t("Start", "শুরু করুন")) { _, _ ->
                 // location-only: the 15-day cap is only a safety valve, arrival ends it
                 val dur = if (mode == UNLOCK_LOC) MAX_MIN * 60_000L else ms
-                Store.startSession(a, dur, "manual", dest, mode, profileId)
-                PlaceWatcher.sync(a) // start watching for the arrival right away
-                PlaceWatcher.checkUnlockNow(a)
-                a.toast(L.t("Protection started", "প্রটেকশন শুরু হয়েছে"))
+                if (Store.startSession(a, dur, "manual", dest, mode, profileId)) {
+                    PlaceWatcher.sync(a) // start watching for the arrival right away
+                    PlaceWatcher.checkUnlockNow(a)
+                    a.toast(L.t("Protection started", "প্রটেকশন শুরু হয়েছে"))
+                } else {
+                    a.toast(L.t("A lock is already running", "একটা লক ইতিমধ্যে চলছে"))
+                }
                 tick()
             }
             .setNegativeButton(L.t("Cancel", "বাতিল"), null)
@@ -2697,6 +2703,7 @@ class StatsScreen(private val a: MainActivity) {
                 left.addView(a.tv(fmtDate(s.start) + " · " + fmtClock(s.start), 14f, C.text, 1))
                 val src = when (s.src) {
                     "schedule" -> L.t("Scheduled", "সময়সূচি")
+                    // legacy label: Pomodoro was removed in build 66; old sessions keep their label
                     "pomodoro" -> "Pomodoro"
                     else -> L.t("Manual", "ম্যানুয়াল")
                 }
@@ -3341,6 +3348,9 @@ class SettingsScreen(private val a: MainActivity) {
                     // the user must turn notifications on in system settings
                     launch(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, a.packageName))
                 }
+            } else {
+                // API < 33 has no runtime notification permission: go straight to system settings
+                launch(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, a.packageName))
             }
         }
         permRow(L.t("Battery optimization off", "ব্যাটারি অপটিমাইজেশন বন্ধ"), Perm.batteryOk(a)) {

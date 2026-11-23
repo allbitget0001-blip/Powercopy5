@@ -101,8 +101,10 @@ object FocusSound {
     /** Stops playback but keeps [wantsPlay], so an audio-focus regain can resume.
      * Returns the worker threads to join — the caller joins them AFTER
      * releasing the monitor (see [joinAsync]), so a stop never blocks the
-     * main thread or holds the lock while workers exit. */
-    private fun halt(): List<Thread> {
+     * main thread or holds the lock while workers exit.
+     * [keepFocus] stops the tracks but keeps the focus request registered,
+     * so AUDIOFOCUS_GAIN still arrives after a transient loss. */
+    private fun halt(keepFocus: Boolean = false): List<Thread> {
         running = false
         val toJoin = ArrayList(workers)
         for (w in toJoin) w.interrupt()
@@ -116,13 +118,15 @@ object FocusSound {
         }
         tracks.clear()
         currentChoice = OFF
-        try {
-            val am = appCtx?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-            val req = focusReq
-            if (am != null && req != null) am.abandonAudioFocusRequest(req)
-        } catch (_: Exception) {
+        if (!keepFocus) {
+            try {
+                val am = appCtx?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+                val req = focusReq
+                if (am != null && req != null) am.abandonAudioFocusRequest(req)
+            } catch (_: Exception) {
+            }
+            focusReq = null
         }
-        focusReq = null
         return toJoin
     }
 
@@ -184,9 +188,17 @@ object FocusSound {
                 .setAudioAttributes(attrs)
                 .setOnAudioFocusChangeListener({ change ->
                     when (change) {
-                        AudioManager.AUDIOFOCUS_LOSS, AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
+                        AudioManager.AUDIOFOCUS_LOSS -> {
                             val tj: List<Thread>
                             synchronized(this) { tj = halt() }
+                            joinAsync(tj)
+                        }
+                        AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
+                            // transient loss: stop the tracks but keep the
+                            // focus request, so AUDIOFOCUS_GAIN still
+                            // arrives and the resume branch below runs
+                            val tj: List<Thread>
+                            synchronized(this) { tj = halt(keepFocus = true) }
                             joinAsync(tj)
                         }
                         AudioManager.AUDIOFOCUS_GAIN -> {
@@ -289,10 +301,14 @@ object FocusSound {
                     // a dead track returns an error instead of throwing: stop
                     // generating into it instead of busy-looping at full CPU
                     Log.e(TAG, "focus sound: write failed ($written)")
+                    // reset state so the next startInternal revives playback
+                    // instead of early-returning on a stale running=true
+                    synchronized(this@FocusSound) { running = false; currentChoice = OFF }
                     break
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "focus sound: write failed", e)
+                synchronized(this@FocusSound) { running = false; currentChoice = OFF }
                 break
             }
         }

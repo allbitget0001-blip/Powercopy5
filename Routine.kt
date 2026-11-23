@@ -262,11 +262,11 @@ object Routine {
 
     // ----- penalty lock -----
 
-    /** Penalty length in minutes (default 30). */
-    fun penaltyMin(ctx: Context): Int = Store.settings(ctx).getInt("routine_penalty", 30)
+    /** Penalty length in minutes (default 30, clamped 1–120). */
+    fun penaltyMin(ctx: Context): Int = Store.settings(ctx).getInt("routine_penalty", 30).coerceIn(1, 120)
 
     fun setPenaltyMin(ctx: Context, min: Int) {
-        Store.settings(ctx).edit().putInt("routine_penalty", min).apply()
+        Store.settings(ctx).edit().putInt("routine_penalty", min.coerceIn(1, 120)).apply()
     }
 
     /** True while the running session is a routine penalty lock. */
@@ -308,6 +308,7 @@ object Routine {
 
     private fun startPenalty(ctx: Context, task: RoutineTask): Boolean {
         val min = penaltyMin(ctx)
+        if (min <= 0) return false
         val ok = Store.startSession(ctx, min * 60_000L, "routine")
         if (!ok) return false
         Store.lock(ctx).edit()
@@ -443,6 +444,18 @@ object Routine {
         return c.timeInMillis
     }
 
+    /** [todayAt] for a past day: [ago] days back (minOfDay may exceed 1440 —
+     * a window crossing midnight rolls into the next day, as in [todayAt]). */
+    private fun dayAt(ago: Int, minOfDay: Int): Long {
+        val c = Calendar.getInstance()
+        c.add(Calendar.DAY_OF_YEAR, -ago)
+        c.set(Calendar.HOUR_OF_DAY, minOfDay / 60)
+        c.set(Calendar.MINUTE, minOfDay % 60)
+        c.set(Calendar.SECOND, 0)
+        c.set(Calendar.MILLISECOND, 0)
+        return c.timeInMillis
+    }
+
     private fun remindPending(ctx: Context, t: RoutineTask, dayKey: String): PendingIntent {
         val i = Intent(ctx, ReminderReceiver::class.java).setAction(ACTION_ROUTINE_REMIND)
             .putExtra("task_id", t.id).putExtra("day", dayKey)
@@ -503,6 +516,19 @@ object Routine {
                 val atOverdue = todayAt(t.timeMin + t.graceMin)
                 if (atOverdue > now) setAlarm(am, atOverdue, overduePending(ctx, t, today))
             }
+            // yesterday's overdue alarms whose window crosses midnight: the
+            // cancel above removed them, and only the overdue alarm can
+            // still be pending (the remind time is already past) — re-arm
+            // the ones still in the future so the miss is still recorded
+            val yDayKey = Store.dayKey(1)
+            val yDone = doneIds(ctx, yDayKey)
+            val yCal = Calendar.getInstance()
+            yCal.add(Calendar.DAY_OF_YEAR, -1)
+            for (t in tasksForDay(ctx, dayIdx(yCal))) {
+                if (t.id in yDone) continue
+                val atOverdue = dayAt(1, t.timeMin + t.graceMin)
+                if (atOverdue > now) setAlarm(am, atOverdue, overduePending(ctx, t, yDayKey))
+            }
             rescheduleReport(ctx)
         } catch (e: Exception) {
             Log.e(TAG, "routine reschedule failed", e)
@@ -530,7 +556,7 @@ object Routine {
             val t = tasksForDayKey(ctx, dayKey).find { it.id == taskId } ?: return
             if (taskId in doneIds(ctx, dayKey)) return
             Reminders.show(
-                ctx, 20000 + (taskId % 1000).toInt(), // routine range 20000–20999
+                ctx, 20000 + ((taskId / 1000) % 1000).toInt(), // routine range 20000–20999
                 L.t("Routine time", "রুটিনের সময়"),
                 t.title
             )

@@ -21,8 +21,6 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.net.Uri
-import android.provider.Settings
 import android.text.Editable
 import android.text.TextWatcher
 import android.util.Log
@@ -78,7 +76,7 @@ object Extra {
 
     /** Build number, bumped on every push — shown in Settings so the user can
      * confirm which build is installed. A String because L.num takes a String. */
-    const val BUILD_ID = "68"
+    const val BUILD_ID = "69"
 
     // ---------- presets ----------
 
@@ -99,7 +97,9 @@ object Extra {
             for (i in 0 until arr.length()) {
                 try {
                     val o = arr.getJSONObject(i)
-                    out.add(Preset(o.getLong("id"), o.getString("n"), o.getInt("m"), o.getBoolean("s")))
+                    val m = o.getInt("m")
+                    if (m < 1 || m > MAX_MIN) continue
+                    out.add(Preset(o.getLong("id"), o.getString("n"), m, o.getBoolean("s")))
                 } catch (_: Exception) {
                     // one malformed entry: skip it, keep the rest
                 }
@@ -110,11 +110,11 @@ object Extra {
         return out
     }
 
-    fun savePresets(ctx: Context, list: List<Preset>) {
+    fun savePresets(ctx: Context, list: List<Preset>): Boolean {
         // a corrupt stored list must never be overwritten with a fresh one
         if (JsonGuard.isCorrupt(Store.settings(ctx), "presets")) {
             Log.e(TAG, "presets corrupt, keeping stored value")
-            return
+            return false
         }
         val arr = JSONArray()
         for (x in list) {
@@ -126,6 +126,7 @@ object Extra {
             arr.put(o)
         }
         Store.settings(ctx).edit().putString("presets", arr.toString()).apply()
+        return true
     }
 
     // ---------- extend time (never reduce) ----------
@@ -172,7 +173,7 @@ object Extra {
                 Log.e(TAG, "attempts corrupt, keeping stored value")
                 val total = p.getLong("blocks_total", 0)
                 p.edit().putLong("blocks_total", total + 1).apply()
-                if (total + 1 == 1000L) Badges.award(ctx, "blocks_1000")
+                if (total + 1 >= 1000L) Badges.award(ctx, "blocks_1000")
                 return
             }
             val old = try {
@@ -191,7 +192,7 @@ object Extra {
             // lifetime block counter (the attempts list is capped at 1000): seeds once from the list
             val total = if (p.contains("blocks_total")) p.getLong("blocks_total", 0) else old.length().toLong()
             p.edit().putString("attempts", out.toString()).putLong("blocks_total", total + 1).apply()
-            if (total + 1 == 1000L) Badges.award(ctx, "blocks_1000")
+            if (total + 1 >= 1000L) Badges.award(ctx, "blocks_1000")
         } catch (e: Exception) {
             Log.e(TAG, "logAttempt failed", e)
         }
@@ -313,14 +314,16 @@ object Extra {
         return out
     }
 
-    /** Set a daily minute limit for one app (min <= 0 removes it). */
-    fun setDailyLimit(ctx: Context, pkg: String, min: Int) {
+    /** Set a daily minute limit for one app (min <= 0 removes it). False when the save failed. */
+    fun setDailyLimit(ctx: Context, pkg: String, min: Int): Boolean {
         try {
             val obj = JSONObject(Store.settings(ctx).getString("dl_limits", "{}"))
             if (min > 0) obj.put(pkg, min) else obj.remove(pkg)
             Store.settings(ctx).edit().putString("dl_limits", obj.toString()).apply()
+            return true
         } catch (e: Exception) {
             Log.e(TAG, "daily limit save failed", e)
+            return false
         }
     }
 
@@ -341,7 +344,14 @@ object Extra {
         if (seconds <= 0) return
         try {
             val p = usagePrefs(ctx)
-            val obj = JSONObject(p.getString("u_$dayKey", "{}"))
+            val obj = try {
+                JSONObject(p.getString("u_$dayKey", "{}"))
+            } catch (_: Exception) {
+                // corrupt day: reset it so later writes stop failing silently
+                // (otherwise usage stays 0 and the daily limit never fires)
+                p.edit().putString("u_$dayKey", "{}").apply()
+                JSONObject("{}")
+            }
             obj.put(pkg, obj.optLong(pkg, 0) + seconds)
             val e = p.edit().putString("u_$dayKey", obj.toString())
             val keep = (0 until 7).map { "u_" + Store.dayKey(it) }.toSet()
@@ -612,11 +622,11 @@ object Extra {
         return out
     }
 
-    fun saveAppGroups(ctx: Context, list: List<AppGroup>) {
+    fun saveAppGroups(ctx: Context, list: List<AppGroup>): Boolean {
         // a corrupt stored list must never be overwritten with a fresh one
         if (JsonGuard.isCorrupt(Store.settings(ctx), "app_groups")) {
             Log.e(TAG, "app groups corrupt, keeping stored value")
-            return
+            return false
         }
         try {
             val arr = JSONArray()
@@ -630,26 +640,28 @@ object Extra {
                 arr.put(o)
             }
             Store.settings(ctx).edit().putString("app_groups", arr.toString()).apply()
+            return true
         } catch (e: Exception) {
             Log.e(TAG, "app groups save failed", e)
+            return false
         }
     }
 
-    fun addAppGroup(ctx: Context, name: String, pkgs: List<String>): AppGroup {
+    /** False when the save was refused (stored data corrupt). */
+    fun addAppGroup(ctx: Context, name: String, pkgs: List<String>): Boolean {
         val g = AppGroup(Store.newId(), name, pkgs)
         val list = appGroups(ctx).toMutableList()
         list.add(g)
-        saveAppGroups(ctx, list)
-        return g
+        return saveAppGroups(ctx, list)
     }
 
-    fun updateAppGroup(ctx: Context, id: Long, name: String, pkgs: List<String>) {
+    fun updateAppGroup(ctx: Context, id: Long, name: String, pkgs: List<String>): Boolean {
         val list = appGroups(ctx).map { if (it.id == id) it.copy(name = name, pkgs = pkgs) else it }
-        saveAppGroups(ctx, list)
+        return saveAppGroups(ctx, list)
     }
 
-    fun deleteAppGroup(ctx: Context, id: Long) {
-        saveAppGroups(ctx, appGroups(ctx).filter { it.id != id })
+    fun deleteAppGroup(ctx: Context, id: Long): Boolean {
+        return saveAppGroups(ctx, appGroups(ctx).filter { it.id != id })
     }
 
     // ---------- lock profiles (named app sets applied at lock start) ----------
@@ -676,11 +688,11 @@ object Extra {
         return out
     }
 
-    fun saveLockProfiles(ctx: Context, list: List<LockProfile>) {
+    fun saveLockProfiles(ctx: Context, list: List<LockProfile>): Boolean {
         // a corrupt stored list must never be overwritten with a fresh one
         if (JsonGuard.isCorrupt(Store.settings(ctx), "lock_profiles")) {
             Log.e(TAG, "lock profiles corrupt, keeping stored value")
-            return
+            return false
         }
         try {
             val arr = JSONArray()
@@ -694,26 +706,28 @@ object Extra {
                 arr.put(o)
             }
             Store.settings(ctx).edit().putString("lock_profiles", arr.toString()).apply()
+            return true
         } catch (e: Exception) {
             Log.e(TAG, "lock profiles save failed", e)
+            return false
         }
     }
 
-    fun addLockProfile(ctx: Context, name: String, pkgs: List<String>): LockProfile {
+    /** False when the save was refused (stored data corrupt). */
+    fun addLockProfile(ctx: Context, name: String, pkgs: List<String>): Boolean {
         val g = LockProfile(Store.newId(), name, pkgs)
         val list = lockProfiles(ctx).toMutableList()
         list.add(g)
-        saveLockProfiles(ctx, list)
-        return g
+        return saveLockProfiles(ctx, list)
     }
 
-    fun updateLockProfile(ctx: Context, id: Long, name: String, pkgs: List<String>) {
+    fun updateLockProfile(ctx: Context, id: Long, name: String, pkgs: List<String>): Boolean {
         val list = lockProfiles(ctx).map { if (it.id == id) it.copy(name = name, pkgs = pkgs) else it }
-        saveLockProfiles(ctx, list)
+        return saveLockProfiles(ctx, list)
     }
 
-    fun deleteLockProfile(ctx: Context, id: Long) {
-        saveLockProfiles(ctx, lockProfiles(ctx).filter { it.id != id })
+    fun deleteLockProfile(ctx: Context, id: Long): Boolean {
+        return saveLockProfiles(ctx, lockProfiles(ctx).filter { it.id != id })
     }
 
     /** Starter groups by well-known package names; only installed apps are kept. */
@@ -795,11 +809,11 @@ object Extra {
         return out
     }
 
-    fun savePlaces(ctx: Context, list: List<Place>) {
+    fun savePlaces(ctx: Context, list: List<Place>): Boolean {
         // a corrupt stored list must never be overwritten with a fresh one
         if (JsonGuard.isCorrupt(Store.settings(ctx), "places")) {
             Log.e(TAG, "places corrupt, keeping stored value")
-            return
+            return false
         }
         val arr = JSONArray()
         for (x in list) {
@@ -815,6 +829,7 @@ object Extra {
             arr.put(o)
         }
         Store.settings(ctx).edit().putString("places", arr.toString()).apply()
+        return true
     }
 
     /** Best recent location, or a fresh single fix (up to 20 s). Calls back on the main thread. */
@@ -1163,7 +1178,7 @@ object PlaceWatcher {
                 .setContentText(L.num(text))
                 .setAutoCancel(true)
                 .setContentIntent(openApp)
-            nm.notify(40000 + (pl.id % 1000).toInt(), nb.build()) // boundary range 40000–40999
+            nm.notify(40000 + ((pl.id.hashCode() and 0x7fffffff) % 1000), nb.build()) // boundary range 40000–40999
         } catch (e: Exception) {
             Log.e(TAG, "boundary notify failed", e)
         }
@@ -1349,16 +1364,22 @@ private fun MainActivity.presetDialog(existing: Preset?, done: () -> Unit) {
             } else {
                 all.map { if (it.id == existing.id) Preset(it.id, name, total.toInt(), strict) else it }
             }
-            Extra.savePresets(this, updated)
-            d.dismiss()
-            done()
+            if (!Extra.savePresets(this, updated)) {
+                toast(L.t("Could not save — stored data is damaged", "সংরক্ষণ করা যায়নি — সংরক্ষিত ডেটা নষ্ট হয়ে গেছে"))
+            } else {
+                d.dismiss()
+                done()
+            }
         }
     }
     if (existing != null) {
         d.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener {
-            Extra.savePresets(this, Extra.presets(this).filter { it.id != existing.id })
-            d.dismiss()
-            done()
+            if (!Extra.savePresets(this, Extra.presets(this).filter { it.id != existing.id })) {
+                toast(L.t("Could not save — stored data is damaged", "সংরক্ষণ করা যায়নি — সংরক্ষিত ডেটা নষ্ট হয়ে গেছে"))
+            } else {
+                d.dismiss()
+                done()
+            }
         }
     }
 }
@@ -1404,23 +1425,35 @@ fun MainActivity.focusCard(): View {
 }
 
 private fun MainActivity.appPicker(done: () -> Unit) {
-    val pm = packageManager
-    val intent = Intent(Intent.ACTION_MAIN)
-    intent.addCategory(Intent.CATEGORY_LAUNCHER)
-    val skip = listOf("dialer", "incallui", "emergency", "telecom", "contacts")
-    val apps = ArrayList<Triple<String, String, Drawable>>()
-    val seen = HashSet<String>()
-    try {
-        for (ri in pm.queryIntentActivities(intent, 0)) {
-            val pkg = ri.activityInfo.packageName
-            if (pkg == packageName || !seen.add(pkg)) continue
-            if (skip.any { pkg.contains(it) }) continue
-            apps.add(Triple(pkg, ri.loadLabel(pm).toString(), ri.loadIcon(pm)))
-        }
-    } catch (e: Exception) {
-        Log.e(TAG, "app list failed", e)
+    // the app list (with icons) is loaded once per session on a background
+    // thread: loading ~150 icons on the main thread froze the UI
+    val cached = Extra.appListCache
+    if (cached != null) {
+        showAppPicker(cached, done)
+        return
     }
-    apps.sortBy { it.second.lowercase() }
+    val loading = dlg()
+        .setTitle(L.t("Loading apps…", "অ্যাপ লোড হচ্ছে…"))
+        .setView(tv(L.t("Please wait…", "একটু অপেক্ষা করুন…"), 14f, C.muted).apply {
+            setPadding(dp(20), dp(16), dp(20), dp(16))
+        })
+        .setCancelable(false)
+        .show()
+    Thread {
+        val apps = loadLaunchableApps()
+        runOnUiThread {
+            try { loading.dismiss() } catch (_: Exception) { }
+            if (apps.isEmpty()) {
+                toast(L.t("No apps found", "কোনো অ্যাপ পাওয়া যায়নি"))
+                return@runOnUiThread
+            }
+            Extra.appListCache = apps
+            showAppPicker(apps, done)
+        }
+    }.start()
+}
+
+private fun MainActivity.showAppPicker(apps: List<Triple<String, String, Drawable>>, done: () -> Unit) {
     if (apps.isEmpty()) {
         toast(L.t("No apps found", "কোনো অ্যাপ পাওয়া যায়নি"))
         return
@@ -1561,6 +1594,10 @@ private fun MainActivity.addPackageDialog(mode: String, done: () -> Unit) {
                 toast(L.t("Not a valid package name", "সঠিক প্যাকেজ নাম নয়"))
                 return@setPositiveButton
             }
+            if (pkg == packageName || listOf("dialer", "incallui", "emergency", "telecom", "contacts").any { pkg.contains(it) }) {
+                toast(L.t("Phone and emergency apps cannot be blocked", "ফোন ও জরুরি অ্যাপ ব্লক করা যাবে না"))
+                return@setPositiveButton
+            }
             // an app can only be in one list: full block wins over reels block;
             // the search list is independent
             when (mode) {
@@ -1623,7 +1660,7 @@ private fun MainActivity.loadLaunchableApps(): List<Triple<String, String, Drawa
             val pkg = ri.activityInfo.packageName
             if (pkg == packageName || !seen.add(pkg)) continue
             if (skip.any { pkg.contains(it) }) continue
-            apps.add(Triple(pkg, ri.loadLabel(pm).toString(), ri.loadIcon(pm)))
+            apps.add(Triple(pkg, ri.loadLabel(pm)?.toString() ?: pkg, ri.loadIcon(pm)))
         }
     } catch (e: Exception) {
         Log.e(TAG, "app list failed", e)
@@ -2144,7 +2181,6 @@ private fun MainActivity.showDailyLimitPicker(apps: List<Triple<String, String, 
     pickerDlg.show()
 }
 
-/** Minute options for one app's daily limit (0 = remove the limit). */
 /** Choose a daily limit for one app (also used from the usage dashboard). */
 fun MainActivity.limitChoiceDialog(pkg: String, label: String, current: Int, done: () -> Unit) {
     val options = intArrayOf(15, 30, 60, 90, 120, 180, 240)
@@ -2155,11 +2191,17 @@ fun MainActivity.limitChoiceDialog(pkg: String, label: String, current: Int, don
         .setTitle(label)
         .setItems(items.toTypedArray()) { _, which ->
             if (which < options.size) {
-                Extra.setDailyLimit(this, pkg, options[which])
-                toast(L.t("Limit set: ", "লিমিট দেওয়া হয়েছে: ") + label + " — " + fmtDur(options[which] * 60_000L) + L.t(" / day", " / দিন"))
+                if (Extra.setDailyLimit(this, pkg, options[which])) {
+                    toast(L.t("Limit set: ", "লিমিট দেওয়া হয়েছে: ") + label + " — " + fmtDur(options[which] * 60_000L) + L.t(" / day", " / দিন"))
+                } else {
+                    toast(L.t("Could not save — stored data is damaged", "সংরক্ষণ করা যায়নি — সংরক্ষিত ডেটা নষ্ট হয়ে গেছে"))
+                }
             } else {
-                Extra.setDailyLimit(this, pkg, 0)
-                toast(L.t("Limit removed: ", "লিমিট তোলা হয়েছে: ") + label)
+                if (Extra.setDailyLimit(this, pkg, 0)) {
+                    toast(L.t("Limit removed: ", "লিমিট তোলা হয়েছে: ") + label)
+                } else {
+                    toast(L.t("Could not save — stored data is damaged", "সংরক্ষণ করা যায়নি — সংরক্ষিত ডেটা নষ্ট হয়ে গেছে"))
+                }
             }
             done()
         }
@@ -2222,6 +2264,7 @@ fun MainActivity.appGroupsCard(): View {
             // full block wins: the apps leave the reels list, like the picker does
             Extra.setAppBlockFull(this, Extra.appBlockFull(this) + g.pkgs)
             Extra.setAppBlockReels(this, Extra.appBlockReels(this) - g.pkgs.toSet())
+            Extra.setManualPackages(this, Extra.manualPackages(this) + g.pkgs)
             toast(L.t("Blocked: ", "ব্লক করা হয়েছে: ") + g.name + " (" + L.num(g.pkgs.size.toString()) + ")")
             go(4)
         }
@@ -2267,25 +2310,37 @@ private fun MainActivity.groupEditorDialog(existing: AppGroup?, done: () -> Unit
     val b = dlg()
         .setTitle(if (existing == null) L.t("New group", "নতুন গ্রুপ") else L.t("Edit group", "গ্রুপ সম্পাদনা"))
         .setView(box)
-        .setPositiveButton(L.t("Save", "সংরক্ষণ")) { _, _ ->
-            val name = nameEt.text.toString().trim()
-            if (name.isEmpty()) {
-                toast(L.t("Give the group a name", "গ্রুপের একটা নাম দিন"))
-                return@setPositiveButton
-            }
-            if (existing == null) Extra.addAppGroup(this, name, chosen.toList())
-            else Extra.updateAppGroup(this, existing.id, name, chosen.toList())
-            done()
-        }
+        .setPositiveButton(L.t("Save", "সংরক্ষণ"), null)
         .setNegativeButton(L.t("Cancel", "বাতিল"), null)
-    if (existing != null) {
-        b.setNeutralButton(L.t("Delete", "মুছুন")) { _, _ ->
-            Extra.deleteAppGroup(this, existing.id)
-            toast(L.t("Group deleted: ", "গ্রুপ মোছা হয়েছে: ") + existing.name)
-            done()
+    if (existing != null) b.setNeutralButton(L.t("Delete", "মুছুন"), null)
+    val d = b.create()
+    d.show()
+    d.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+        val name = nameEt.text.toString().trim()
+        if (name.isEmpty()) {
+            toast(L.t("Give the group a name", "গ্রুপের একটা নাম দিন"))
+        } else {
+            val ok = if (existing == null) Extra.addAppGroup(this, name, chosen.toList())
+            else Extra.updateAppGroup(this, existing.id, name, chosen.toList())
+            if (!ok) {
+                toast(L.t("Could not save — stored data is damaged", "সংরক্ষণ করা যায়নি — সংরক্ষিত ডেটা নষ্ট হয়ে গেছে"))
+            } else {
+                d.dismiss()
+                done()
+            }
         }
     }
-    b.show()
+    if (existing != null) {
+        d.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener {
+            if (!Extra.deleteAppGroup(this, existing.id)) {
+                toast(L.t("Could not save — stored data is damaged", "সংরক্ষণ করা যায়নি — সংরক্ষিত ডেটা নষ্ট হয়ে গেছে"))
+            } else {
+                toast(L.t("Group deleted: ", "গ্রুপ মোছা হয়েছে: ") + existing.name)
+                d.dismiss()
+                done()
+            }
+        }
+    }
 }
 
 /** Multi-select app picker for a group. Reuses the cached launchable-app list. */
@@ -2457,25 +2512,37 @@ private fun MainActivity.profileEditorDialog(existing: LockProfile?, done: () ->
     val b = dlg()
         .setTitle(if (existing == null) L.t("New profile", "নতুন প্রোফাইল") else L.t("Edit profile", "প্রোফাইল সম্পাদনা"))
         .setView(box)
-        .setPositiveButton(L.t("Save", "সংরক্ষণ")) { _, _ ->
-            val name = nameEt.text.toString().trim()
-            if (name.isEmpty()) {
-                toast(L.t("Give the profile a name", "প্রোফাইলের একটা নাম দিন"))
-                return@setPositiveButton
-            }
-            if (existing == null) Extra.addLockProfile(this, name, chosen.toList())
-            else Extra.updateLockProfile(this, existing.id, name, chosen.toList())
-            done()
-        }
+        .setPositiveButton(L.t("Save", "সংরক্ষণ"), null)
         .setNegativeButton(L.t("Cancel", "বাতিল"), null)
-    if (existing != null) {
-        b.setNeutralButton(L.t("Delete", "মুছুন")) { _, _ ->
-            Extra.deleteLockProfile(this, existing.id)
-            toast(L.t("Profile deleted: ", "প্রোফাইল মোছা হয়েছে: ") + existing.name)
-            done()
+    if (existing != null) b.setNeutralButton(L.t("Delete", "মুছুন"), null)
+    val d = b.create()
+    d.show()
+    d.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+        val name = nameEt.text.toString().trim()
+        if (name.isEmpty()) {
+            toast(L.t("Give the profile a name", "প্রোফাইলের একটা নাম দিন"))
+        } else {
+            val ok = if (existing == null) Extra.addLockProfile(this, name, chosen.toList())
+            else Extra.updateLockProfile(this, existing.id, name, chosen.toList())
+            if (!ok) {
+                toast(L.t("Could not save — stored data is damaged", "সংরক্ষণ করা যায়নি — সংরক্ষিত ডেটা নষ্ট হয়ে গেছে"))
+            } else {
+                d.dismiss()
+                done()
+            }
         }
     }
-    b.show()
+    if (existing != null) {
+        d.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener {
+            if (!Extra.deleteLockProfile(this, existing.id)) {
+                toast(L.t("Could not save — stored data is damaged", "সংরক্ষণ করা যায়নি — সংরক্ষিত ডেটা নষ্ট হয়ে গেছে"))
+            } else {
+                toast(L.t("Profile deleted: ", "প্রোফাইল মোছা হয়েছে: ") + existing.name)
+                d.dismiss()
+                done()
+            }
+        }
+    }
 }
 
 // =====================================================================
@@ -2494,6 +2561,7 @@ fun MainActivity.siteBlockCard(): View {
         ),
         lp(MATCH, WRAP, t = dp(6))
     )
+    val locked = Store.isActive(this)
     val stateText = tv("", 13f, C.primary)
     fun refreshState() {
         stateText.text = when {
@@ -2519,6 +2587,7 @@ fun MainActivity.siteBlockCard(): View {
         }
         refreshState()
     }
+    if (locked) sw.isEnabled = false
     c.addView(row(L.t("Block sites during a lock", "লক চলাকালীন সাইট ব্লক"), null, sw))
     c.addView(stateText, lp(MATCH, WRAP, t = dp(6)))
     // the blocklist: tap ✕ to remove a domain
@@ -2535,6 +2604,10 @@ fun MainActivity.siteBlockCard(): View {
             val del = tv("✕", 16f, C.muted, 1)
             del.setPadding(dp(10), dp(4), dp(4), dp(4))
             del.setOnClickListener {
+                if (Store.isActive(this)) {
+                    toast(L.t("Locked while a session is active", "সেশন চলাকালীন বদলানো যাবে না"))
+                    return@setOnClickListener
+                }
                 SiteBlock.saveBlocklist(this, SiteBlock.blocklist(this) - d)
                 refreshList()
             }
@@ -2567,6 +2640,9 @@ fun MainActivity.siteBlockCard(): View {
     }
     addRow.addView(addBtn, lp(WRAP, WRAP, l = dp(10)))
     c.addView(addRow, lp(MATCH, WRAP, t = dp(10)))
+    if (locked) {
+        c.addView(tv(L.t("Locked while a session is active.", "সেশন চলাকালীন বদলানো যাবে না।"), 12f, C.warn), lp(MATCH, WRAP, t = dp(8)))
+    }
     return c
 }
 
@@ -2599,10 +2675,17 @@ fun MainActivity.locationCard(): View {
     val st = Store.settings(this)
     // header first: title on the left, master on/off on the right
     lateinit var sw: PremiumSwitch
+    // every flip bumps this: a still-pending location check belongs to an
+    // older flip and must not apply its result (PremiumSwitch exposes no
+    // checked getter, so the generation is the state re-check)
+    var locCheckGen = 0
     sw = toggle(st.getBoolean("loc_on", false)) { v ->
+        locCheckGen++
         if (!v && Store.isLocProtecting(this)) {
             // locked right now: only leaving the place turns it off
+            val gen = locCheckGen
             PlaceWatcher.isAnyPlaceActiveNow(this) { active ->
+                if (gen != locCheckGen) return@isAnyPlaceActiveNow
                 if (active == true) {
                     toast(L.t("You are at a saved place — the lock turns off when you leave.", "সেভ করা জায়গায় আছেন — জায়গা ছেড়ে গেলে লক নিজে নিজে বন্ধ হবে।"))
                     sw.setCheckedImmediate(true)
@@ -2644,17 +2727,27 @@ fun MainActivity.locationCard(): View {
     val places = Extra.places(this)
     for (pl in places) {
         lateinit var rowSw: PremiumSwitch
+        // every flip bumps this: a still-pending location check belongs to an
+        // older flip and must not apply its result
+        var placeCheckGen = 0
         rowSw = toggle(pl.enabled) { v ->
+            placeCheckGen++
             if (!v && Store.isLocProtecting(this)) {
                 // this place may be locking right now: only leaving turns it off
+                val gen = placeCheckGen
                 PlaceWatcher.isPlaceActiveNow(this, pl) { active ->
+                    if (gen != placeCheckGen) return@isPlaceActiveNow
                     if (active == true) {
                         toast(L.t("This place is locking right now — it turns off when you leave.", "এই জায়গায় এখন লক চলছে — জায়গা ছেড়ে গেলে নিজে নিজে বন্ধ হবে।"))
                         rowSw.setCheckedImmediate(true)
                     } else if (active == false) {
-                        Extra.savePlaces(this, Extra.places(this).map { if (it.id == pl.id) it.copy(enabled = false) else it })
-                        PlaceWatcher.sync(this)
-                        PlaceWatcher.checkNow(this)
+                        if (!Extra.savePlaces(this, Extra.places(this).map { if (it.id == pl.id) it.copy(enabled = false) else it })) {
+                            toast(L.t("Could not save — stored data is damaged", "সংরক্ষণ করা যায়নি — সংরক্ষিত ডেটা নষ্ট হয়ে গেছে"))
+                            rowSw.setCheckedImmediate(true)
+                        } else {
+                            PlaceWatcher.sync(this)
+                            PlaceWatcher.checkNow(this)
+                        }
                     } else {
                         toast(L.t("Location unavailable — turn on GPS and try again.", "অবস্থান পাওয়া যাচ্ছে না — GPS চালু করে আবার চেষ্টা করুন।"))
                         rowSw.setCheckedImmediate(true)
@@ -2662,9 +2755,13 @@ fun MainActivity.locationCard(): View {
                 }
                 return@toggle
             }
-            Extra.savePlaces(this, Extra.places(this).map { if (it.id == pl.id) it.copy(enabled = v) else it })
-            PlaceWatcher.sync(this)
-            PlaceWatcher.checkNow(this)
+            if (!Extra.savePlaces(this, Extra.places(this).map { if (it.id == pl.id) it.copy(enabled = v) else it })) {
+                toast(L.t("Could not save — stored data is damaged", "সংরক্ষণ করা যায়নি — সংরক্ষিত ডেটা নষ্ট হয়ে গেছে"))
+                rowSw.setCheckedImmediate(!v)
+            } else {
+                PlaceWatcher.sync(this)
+                PlaceWatcher.checkNow(this)
+            }
         }
         val modeTxt = if (pl.mode == PLACE_MODE_OUTSIDE) L.t("Lock when away", "বাইরে গেলে লক") else L.t("Lock when here", "এখানে থাকলে লক")
         val sub = L.num("${pl.radius} " + L.t("m radius", "মি. ব্যাসার্ধ")) + " · " + modeTxt
@@ -2817,17 +2914,27 @@ private fun fmtDayShort(ms: Long): String {
 }
 
 private fun MainActivity.deletePlaceDialog(pl: Place, done: () -> Unit) {
-    dlg()
+    val d = dlg()
         .setTitle(L.t("Delete this place?", "এই জায়গা মুছবেন?"))
         .setMessage(pl.name)
-        .setPositiveButton(L.t("Delete", "মুছুন")) { _, _ ->
-            Extra.savePlaces(this, Extra.places(this).filter { it.id != pl.id })
-            PlaceWatcher.sync(this)
-            PlaceWatcher.checkNow(this)
-            done()
-        }
+        .setPositiveButton(L.t("Delete", "মুছুন"), null)
         .setNegativeButton(L.t("Cancel", "বাতিল"), null)
-        .show()
+        .create()
+    d.show()
+    d.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+        // re-check at confirm time, like the map does: the place may have
+        // started locking since the dialog opened
+        ifPlaceNotLocking(pl) {
+            if (!Extra.savePlaces(this, Extra.places(this).filter { it.id != pl.id })) {
+                toast(L.t("Could not save — stored data is damaged", "সংরক্ষণ করা যায়নি — সংরক্ষিত ডেটা নষ্ট হয়ে গেছে"))
+            } else {
+                PlaceWatcher.sync(this)
+                PlaceWatcher.checkNow(this)
+                d.dismiss()
+                done()
+            }
+        }
+    }
 }
 
 private fun MainActivity.addPlaceFlow(done: () -> Unit) {
@@ -2928,11 +3035,14 @@ private fun MainActivity.placeDialog(lat: Double, lng: Double, done: () -> Unit)
         } else {
             val id = Store.newId()
             // no time: the lock follows presence only, so the place has no duration (min = 0)
-            Extra.savePlaces(this, Extra.places(this) + Place(id, name, lat, lng, radius, 0, true, mode))
-            PlaceWatcher.sync(this)
-            PlaceWatcher.checkNow(this)
-            d.dismiss()
-            done()
+            if (!Extra.savePlaces(this, Extra.places(this) + Place(id, name, lat, lng, radius, 0, true, mode))) {
+                toast(L.t("Could not save — stored data is damaged", "সংরক্ষণ করা যায়নি — সংরক্ষিত ডেটা নষ্ট হয়ে গেছে"))
+            } else {
+                PlaceWatcher.sync(this)
+                PlaceWatcher.checkNow(this)
+                d.dismiss()
+                done()
+            }
         }
     }
 }
@@ -3013,8 +3123,8 @@ fun MainActivity.attemptsCard(): View {
     c.addView(
         tv(
             L.t(
-                "Power menu: $nPower · App settings: $nSettings · Focus apps: $nFocus · App block: $nAppBlock · Reels block: $nReels · Search block: $nMsgSearch · Daily limit: $nLimit · Image guard: $nImage",
-                "পাওয়ার মেনু: $nPower · অ্যাপ সেটিংস: $nSettings · ফোকাস অ্যাপ: $nFocus · অ্যাপ ব্লক: $nAppBlock · রিলস ব্লক: $nReels · সার্চ ব্লক: $nMsgSearch · দৈনিক লিমিট: $nLimit · ছবি সুরক্ষা: $nImage"
+                "Power menu: $nPower · App settings: $nSettings · Focus apps: $nFocus · App block: $nAppBlock · Reels block: $nReels · Search block: $nMsgSearch · Daily limit: $nLimit" + if (nImage > 0) " · Image guard: $nImage" else "",
+                "পাওয়ার মেনু: $nPower · অ্যাপ সেটিংস: $nSettings · ফোকাস অ্যাপ: $nFocus · অ্যাপ ব্লক: $nAppBlock · রিলস ব্লক: $nReels · সার্চ ব্লক: $nMsgSearch · দৈনিক লিমিট: $nLimit" + if (nImage > 0) " · ছবি সুরক্ষা: $nImage" else ""
             ),
             12f, C.muted
         ),

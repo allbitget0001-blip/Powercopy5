@@ -107,8 +107,11 @@ object StreakProtection {
             val p = Store.lock(ctx)
             val today = Store.dayKey(0)
             if (p.getString("streak_check_day", "") == today) return
-            p.edit().putString("streak_check_day", today).apply()
+            // check for a token BEFORE marking the day: stamping first would
+            // burn the day when no token exists yet, so a token earned later
+            // the same day could never save the streak
             if (tokens(ctx) <= 0) return
+            p.edit().putString("streak_check_day", today).apply()
             val yest = Store.dayKey(1)
             // focus streak: yesterday had no focus, but the streak before it was alive
             val focusMap = Store.focusDayMap(ctx)
@@ -321,6 +324,21 @@ object LuckyWheel {
 
     /** Opens the wheel when spins are available; [onDone] refreshes the UI after a spin. */
     fun showWheel(a: MainActivity, onDone: () -> Unit) {
+        // reconcile a spin that was paid for but killed mid-animation: its
+        // reward was recorded before the spin started, so apply it once now
+        // (cleared with commit() BEFORE applying, so a second kill here
+        // can't double-apply it) and show the result instead of the wheel
+        val pending = Store.lock(a).getString("wheel_pending_reward", null)
+        if (!pending.isNullOrEmpty()) {
+            Store.lock(a).edit().remove("wheel_pending_reward").commit()
+            val pendingText = applyReward(a, pending)
+            a.dlg()
+                .setTitle(L.t("You won!", "তুমি জিতেছো!"))
+                .setMessage(pendingText)
+                .setPositiveButton(L.t("Great!", "ভালো হয়েছে!")) { _, _ -> onDone() }
+                .show()
+            return
+        }
         if (spins(a) <= 0) {
             a.toast(L.t("No spins left — complete a lock to earn one!", "স্পিন নেই — একটা লক সম্পন্ন করে স্পিন পান!"))
             return
@@ -360,12 +378,19 @@ object LuckyWheel {
             Store.lock(a).edit().putInt("wheel_spins", spins(a) - 1).apply()
             countText.text = L.t("Spins left: ", "স্পিন বাকি: ") + L.num(spins(a).toString())
             val won = roll(a)
+            // record the won reward BEFORE animating (commit, not apply, so
+            // it survives a process kill mid-spin): the reward is applied in
+            // the completion callback, or reconciled on the next showWheel
+            Store.lock(a).edit().putString("wheel_pending_reward", won.id).commit()
             val winIdx = avail.indexOf(won).coerceAtLeast(0)
             wheel.spinTo(winIdx) {
                 try {
                     dlg.dismiss()
                 } catch (_: Exception) {
                 }
+                // clear the pending record BEFORE applying, so the reward
+                // can never be applied twice (see the showWheel reconcile)
+                Store.lock(a).edit().remove("wheel_pending_reward").commit()
                 val text = applyReward(a, won.id)
                 // the spin may have ended via cancel after the view detached
                 // (activity going away): the reward is already applied, so
@@ -397,10 +422,12 @@ class WheelView(ctx: Context) : View(ctx) {
         }
         val seg = 360f / segs.size
         val center = (index + 0.5f) * seg
-        // the pointer sits at the top (270°); rotate so the winning centre lands there
-        val offset = ((270f - center) % 360f + 360f) % 360f
-        val jitter = (Random.nextFloat() - 0.5f) * seg * 0.5f
         val from = rotationDeg
+        // the pointer sits at the top (270°); rotate so the winning centre lands there
+        // (offset must account for the current rotation, or a second spin
+        // on the same view lands on the wrong segment)
+        val offset = ((270f - center - from) % 360f + 360f) % 360f
+        val jitter = (Random.nextFloat() - 0.5f) * seg * 0.5f
         val to = from + 360f * 5 + offset + jitter
         anim?.cancel()
         val va = ValueAnimator.ofFloat(from, to)

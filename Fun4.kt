@@ -42,6 +42,12 @@ object TimeCapsules {
     private const val MAX_CAPSULES = 50
     private const val MAX_TEXT = 1000
 
+    // Capsule ids already notified in this process: if the stored JSON is
+    // corrupt, save() refuses to persist notified=true, so without this the
+    // same capsule would re-notify on every checkDue call. The persisted
+    // flag still governs across restarts.
+    private val notifiedThisProcess = HashSet<Long>()
+
     fun all(ctx: Context): List<TimeCapsule> {
         val out = ArrayList<TimeCapsule>()
         try {
@@ -171,10 +177,11 @@ object TimeCapsules {
             val list = all(ctx)
             var changed = false
             val updated = list.map { c ->
-                if (isDue(c, now) && !c.notified) {
+                if (isDue(c, now) && !c.notified && c.id !in notifiedThisProcess) {
                     changed = true
+                    notifiedThisProcess.add(c.id)
                     Reminders.show(
-                        ctx, 30000 + (c.id % 50).toInt(), // capsule range 30000–30049
+                        ctx, 30000 + ((c.id / 1000) % 50).toInt(), // capsule range 30000–30049
                         L.t("Your time capsule opened!", "তোমার টাইম ক্যাপসুল খুলে গেছে!"),
                         L.t("A letter from your past self is ready to read.", "তোমার অতীতের নিজের চিঠি পড়ার সময় হয়েছে।")
                     )
@@ -267,6 +274,11 @@ object VoiceQuotes {
             }
             if (tts == null) {
                 pending = Triple(ctx.applicationContext, en, bn)
+                // a stale ready=true from an engine shut down earlier must
+                // not survive: the new engine is not ready until its init
+                // callback runs, or a rapid second speak() would take the
+                // speakNow path on the uninitialized engine
+                ready = false
                 tts = TextToSpeech(ctx.applicationContext) { status ->
                     if (status == TextToSpeech.SUCCESS) {
                         ready = true
